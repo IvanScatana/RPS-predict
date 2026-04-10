@@ -19,16 +19,13 @@ EN_TO_OUTCOME = {v: k for k, v in OUTCOME_TO_EN.items()}
 # Работа с CSV
 # ========================
 def ensure_csv():
-    """Создаёт CSV с заголовками, если его нет."""
     expected_cols = ['match_id', 'round', 'opp_match_wins', 'opp_match_winrate', 'stake',
                      'opp_move', 'my_move', 'outcome', 'score_me_before', 'score_opp_before',
                      'prev_opp_move', 'prev_outcome', 'streak_draws', 'prev2_opp_move']
     if not os.path.exists(DATA_PATH):
         pd.DataFrame(columns=expected_cols).to_csv(DATA_PATH, index=False, sep=',', encoding='utf-8')
-        st.info("Создан новый файл истории.")
 
 def clean_unfinished():
-    """Удаляет незавершённые матчи (без 3 побед)."""
     if not os.path.exists(DATA_PATH):
         return
     df = pd.read_csv(DATA_PATH, sep=',', encoding='utf-8')
@@ -89,6 +86,7 @@ if 'game_state' not in st.session_state:
     st.session_state.score_opp = 0
     st.session_state.streak_draws = 0
     st.session_state.opp_stats = {'wins': 0, 'winrate': 0.5, 'stake': 25}
+    st.session_state.next_prediction = None  # (pred_move, your_move)
 
 st.set_page_config(page_title="RPS Predictor", layout="centered")
 st.title("🎮 Предсказатель хода в 'Камень-Ножницы-Бумага'")
@@ -121,6 +119,15 @@ if st.session_state.game_state == 'setup':
             st.session_state.score_me = 0
             st.session_state.score_opp = 0
             st.session_state.streak_draws = 0
+            # Предсказание для первого раунда
+            feats = {
+                'opp_move': 'К', 'my_move': 'К', 'outcome': 'draw',
+                'prev_opp_move': '-1', 'prev_outcome': 'none', 'prev2_opp_move': '-1',
+                'score_me_before': 0, 'score_opp_before': 0, 'streak_draws': 0,
+                'stake': stake, 'opp_match_wins': wins, 'opp_match_winrate': winrate
+            }
+            pred, your = predict_move(pipeline, le_target, feats)
+            st.session_state.next_prediction = (pred, your)
             st.rerun()
 
 # ========================
@@ -129,115 +136,112 @@ if st.session_state.game_state == 'setup':
 elif st.session_state.game_state == 'playing':
     st.info(f"Счёт: **{st.session_state.score_me} : {st.session_state.score_opp}** | Раунд {st.session_state.round_num} | Матч #{st.session_state.match_id}")
 
-    # Первый раунд – предсказание без ввода
-    if len(st.session_state.history) == 0:
-        feats = {
-            'opp_move': 'К', 'my_move': 'К', 'outcome': 'draw',
-            'prev_opp_move': '-1', 'prev_outcome': 'none', 'prev2_opp_move': '-1',
-            'score_me_before': 0, 'score_opp_before': 0, 'streak_draws': 0,
-            'stake': st.session_state.opp_stats['stake'],
-            'opp_match_wins': st.session_state.opp_stats['wins'],
-            'opp_match_winrate': st.session_state.opp_stats['winrate']
-        }
-        pred, your = predict_move(pipeline, le_target, feats)
-        st.success(f"Предсказание на **первый раунд**: противник – {pred}, вам – {your}")
+    # Показываем предсказание для текущего раунда (если есть)
+    if st.session_state.next_prediction:
+        pred_move, your_move = st.session_state.next_prediction
+        st.success(f"🤖 Предсказание на **раунд {st.session_state.round_num}**: противник – **{pred_move}**, вам – **{your_move}**")
+    else:
+        st.info("Предсказание загружается...")
 
     with st.form("round"):
-        st.subheader(f"Раунд {st.session_state.round_num}")
+        st.subheader(f"Введите данные раунда {st.session_state.round_num}")
         col1, col2 = st.columns(2)
         with col1:
             opp = st.selectbox("Ход противника", ["Камень", "Ножницы", "Бумага"], key="opp")
         with col2:
             out = st.selectbox("Исход для вас", ["Победа", "Поражение", "Ничья"], key="out")
-        if st.form_submit_button("Записать раунд и предсказать следующий"):
-            opp_letter = MOVE_TO_LETTER[opp]
-            outcome = OUTCOME_TO_EN[out]
+        submitted = st.form_submit_button("✅ Записать раунд")
 
-            # Вычисляем свой ход
-            beat = {'К': 'Б', 'Н': 'К', 'Б': 'Н'}
-            lose = {'К': 'Н', 'Н': 'Б', 'Б': 'К'}
-            if outcome == 'win':
-                my_letter = beat[opp_letter]
-            elif outcome == 'lose':
-                my_letter = lose[opp_letter]
-            else:
-                my_letter = opp_letter
+    if submitted:
+        opp_letter = MOVE_TO_LETTER[opp]
+        outcome = OUTCOME_TO_EN[out]
 
-            prev_opp = st.session_state.history[-1]['opp_move'] if st.session_state.history else '-1'
-            prev_out = st.session_state.history[-1]['outcome'] if st.session_state.history else 'none'
-            prev2_opp = st.session_state.history[-2]['opp_move'] if len(st.session_state.history) >= 2 else '-1'
+        # Вычисляем свой ход
+        beat = {'К': 'Б', 'Н': 'К', 'Б': 'Н'}
+        lose = {'К': 'Н', 'Н': 'Б', 'Б': 'К'}
+        if outcome == 'win':
+            my_letter = beat[opp_letter]
+        elif outcome == 'lose':
+            my_letter = lose[opp_letter]
+        else:
+            my_letter = opp_letter
 
-            new_row = {
-                'match_id': st.session_state.match_id,
-                'round': st.session_state.round_num,
-                'opp_match_wins': st.session_state.opp_stats['wins'],
-                'opp_match_winrate': st.session_state.opp_stats['winrate'],
-                'stake': st.session_state.opp_stats['stake'],
-                'opp_move': opp_letter,
-                'my_move': my_letter,
-                'outcome': outcome,
-                'score_me_before': st.session_state.score_me,
-                'score_opp_before': st.session_state.score_opp,
-                'prev_opp_move': prev_opp,
-                'prev_outcome': prev_out,
-                'streak_draws': st.session_state.streak_draws,
-                'prev2_opp_move': prev2_opp
-            }
-            st.session_state.history.append(new_row)
+        prev_opp = st.session_state.history[-1]['opp_move'] if st.session_state.history else '-1'
+        prev_out = st.session_state.history[-1]['outcome'] if st.session_state.history else 'none'
+        prev2_opp = st.session_state.history[-2]['opp_move'] if len(st.session_state.history) >= 2 else '-1'
 
-            # Обновляем счёт
-            if outcome == 'win':
-                st.session_state.score_me += 1
-                st.session_state.streak_draws = 0
-            elif outcome == 'lose':
-                st.session_state.score_opp += 1
-                st.session_state.streak_draws = 0
-            else:
-                st.session_state.streak_draws += 1
+        new_row = {
+            'match_id': st.session_state.match_id,
+            'round': st.session_state.round_num,
+            'opp_match_wins': st.session_state.opp_stats['wins'],
+            'opp_match_winrate': st.session_state.opp_stats['winrate'],
+            'stake': st.session_state.opp_stats['stake'],
+            'opp_move': opp_letter,
+            'my_move': my_letter,
+            'outcome': outcome,
+            'score_me_before': st.session_state.score_me,
+            'score_opp_before': st.session_state.score_opp,
+            'prev_opp_move': prev_opp,
+            'prev_outcome': prev_out,
+            'streak_draws': st.session_state.streak_draws,
+            'prev2_opp_move': prev2_opp
+        }
+        st.session_state.history.append(new_row)
 
-            # Сохраняем в CSV
-            df_new = pd.DataFrame([new_row])
-            if os.path.exists(DATA_PATH):
-                existing = pd.read_csv(DATA_PATH, sep=',', encoding='utf-8')
-                df_combined = pd.concat([existing, df_new], ignore_index=True)
-            else:
-                df_combined = df_new
-            df_combined.to_csv(DATA_PATH, index=False, sep=',', encoding='utf-8')
-            st.cache_data.clear()
+        # Обновляем счёт
+        if outcome == 'win':
+            st.session_state.score_me += 1
+            st.session_state.streak_draws = 0
+        elif outcome == 'lose':
+            st.session_state.score_opp += 1
+            st.session_state.streak_draws = 0
+        else:
+            st.session_state.streak_draws += 1
 
-            # Проверка окончания матча
-            if st.session_state.score_me >= 3 or st.session_state.score_opp >= 3:
-                st.session_state.game_state = 'finished'
-                st.success(f"Матч #{st.session_state.match_id} окончен! Счёт {st.session_state.score_me}:{st.session_state.score_opp}")
-                st.rerun()
+        # Сохраняем в CSV
+        df_new = pd.DataFrame([new_row])
+        if os.path.exists(DATA_PATH):
+            existing = pd.read_csv(DATA_PATH, sep=',', encoding='utf-8')
+            df_combined = pd.concat([existing, df_new], ignore_index=True)
+        else:
+            df_combined = df_new
+        df_combined.to_csv(DATA_PATH, index=False, sep=',', encoding='utf-8')
+        st.cache_data.clear()
 
-            # Предсказание следующего раунда
-            feats = {
-                'opp_move': opp_letter,
-                'my_move': my_letter,
-                'outcome': outcome,
-                'prev_opp_move': prev_opp,
-                'prev_outcome': prev_out,
-                'prev2_opp_move': prev2_opp,
-                'score_me_before': st.session_state.score_me,
-                'score_opp_before': st.session_state.score_opp,
-                'streak_draws': st.session_state.streak_draws,
-                'stake': st.session_state.opp_stats['stake'],
-                'opp_match_wins': st.session_state.opp_stats['wins'],
-                'opp_match_winrate': st.session_state.opp_stats['winrate']
-            }
-            pred, your = predict_move(pipeline, le_target, feats)
-            st.success(f"Предсказание на **следующий раунд**: противник – {pred}, вам – {your}")
-
-            st.session_state.round_num += 1
+        # Проверка окончания матча
+        if st.session_state.score_me >= 3 or st.session_state.score_opp >= 3:
+            st.session_state.game_state = 'finished'
+            st.session_state.next_prediction = None
+            st.success(f"🏆 Матч #{st.session_state.match_id} окончен! Счёт {st.session_state.score_me}:{st.session_state.score_opp}")
             st.rerun()
+
+        # Вычисляем предсказание для следующего раунда
+        feats = {
+            'opp_move': opp_letter,
+            'my_move': my_letter,
+            'outcome': outcome,
+            'prev_opp_move': prev_opp,
+            'prev_outcome': prev_out,
+            'prev2_opp_move': prev2_opp,
+            'score_me_before': st.session_state.score_me,
+            'score_opp_before': st.session_state.score_opp,
+            'streak_draws': st.session_state.streak_draws,
+            'stake': st.session_state.opp_stats['stake'],
+            'opp_match_wins': st.session_state.opp_stats['wins'],
+            'opp_match_winrate': st.session_state.opp_stats['winrate']
+        }
+        pred, your = predict_move(pipeline, le_target, feats)
+        st.session_state.next_prediction = (pred, your)
+
+        st.session_state.round_num += 1
+        st.rerun()
 
 # ========================
 # Завершение матча
 # ========================
 elif st.session_state.game_state == 'finished':
     st.info(f"Итоговый счёт матча #{st.session_state.match_id}: {st.session_state.score_me} : {st.session_state.score_opp}")
-    if st.button("Начать новый матч"):
+    if st.button("➕ Начать новый матч"):
         clean_unfinished()
         st.session_state.game_state = 'setup'
         st.session_state.history = []
@@ -245,6 +249,7 @@ elif st.session_state.game_state == 'finished':
         st.session_state.score_opp = 0
         st.session_state.round_num = 1
         st.session_state.streak_draws = 0
+        st.session_state.next_prediction = None
         st.rerun()
 
 # ========================
@@ -264,6 +269,6 @@ with st.expander("📜 История сохранённых раундов (з�
                 df_disp['prev_outcome'] = df_disp['prev_outcome'].map(lambda x: EN_TO_OUTCOME.get(x, x))
             st.dataframe(df_disp.tail(20))
         else:
-            st.write("Файл истории пуст. Сыграйте несколько матчей.")
+            st.write("Нет сохранённых данных.")
     else:
-        st.write("Файл истории не найден. После первого раунда он будет создан.")
+        st.write("Файл истории не найден.")
