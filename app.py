@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import joblib
 import os
+import time
 
 # ========================
 # Конфигурация
@@ -28,6 +29,7 @@ def ensure_csv():
         st.info("Создан новый файл истории.")
 
 def clean_unfinished():
+    """Удаляет из CSV все незавершённые матчи (без 3 побед)."""
     if not os.path.exists(DATA_PATH):
         return
     df = pd.read_csv(DATA_PATH, sep=',', encoding='utf-8')
@@ -111,8 +113,10 @@ if 'game_state' not in st.session_state:
 st.set_page_config(page_title="Помощник в игре Камень - Ножницы - Бумага", layout="wide")
 st.title("🎮 Помощник в игре 'Камень - Ножницы - Бумага'")
 
+# Создаём файл, если его нет (без очистки незавершённых!)
 ensure_csv()
-clean_unfinished()
+# НЕ вызываем clean_unfinished() здесь, чтобы не удалять текущий матч
+
 pipeline, le_target = load_model()
 if pipeline is None:
     st.stop()
@@ -132,6 +136,8 @@ if st.session_state.game_state == 'setup':
         with c3:
             stake = st.selectbox("Ставка", [25, 50, 100])
         if st.form_submit_button("Начать матч"):
+            # Очищаем только старые завершённые матчи (не трогаем текущий)
+            clean_unfinished()
             st.session_state.opp_stats = {'wins': wins, 'winrate': winrate, 'stake': stake}
             st.session_state.match_id = next_match_id()
             st.session_state.game_state = 'playing'
@@ -156,7 +162,6 @@ if st.session_state.game_state == 'setup':
 # Игровой процесс
 # ========================
 elif st.session_state.game_state == 'playing':
-    # Игровая часть (основная)
     st.info(f"Счёт: **{st.session_state.score_me} : {st.session_state.score_opp}** | Раунд {st.session_state.round_num} | Матч #{st.session_state.match_id}")
 
     if st.session_state.next_prediction:
@@ -165,7 +170,6 @@ elif st.session_state.game_state == 'playing':
 
     st.subheader("Выберите ход противника и исход раунда")
 
-    # Кнопки для хода противника
     col1, col2, col3 = st.columns(3)
     opp_type_n = "primary" if st.session_state.selected_opp == "Ножницы" else "secondary"
     opp_type_k = "primary" if st.session_state.selected_opp == "Камень" else "secondary"
@@ -184,7 +188,6 @@ elif st.session_state.game_state == 'playing':
             st.session_state.selected_opp = "Бумага"
             st.rerun()
 
-    # Кнопки для исхода
     st.markdown("**Исход для вас:**")
     col4, col5, col6 = st.columns(3)
     out_type_l = "primary" if st.session_state.selected_outcome == "Поражение" else "secondary"
@@ -204,7 +207,6 @@ elif st.session_state.game_state == 'playing':
             st.session_state.selected_outcome = "Победа"
             st.rerun()
 
-    # Кнопка "Следующий раунд"
     next_round_disabled = (st.session_state.selected_opp is None or st.session_state.selected_outcome is None)
     if st.button("➡️ Записать раунд и предсказать следующий", width='stretch', disabled=next_round_disabled):
         opp_move_full = st.session_state.selected_opp
@@ -253,22 +255,14 @@ elif st.session_state.game_state == 'playing':
         else:
             st.session_state.streak_draws += 1
 
-        # Запись в CSV (принудительно сбрасываем кэш и перезаписываем файл)
+        # Запись в CSV (добавление строки)
         df_new = pd.DataFrame([new_row])
-        if os.path.exists(DATA_PATH):
-            existing = pd.read_csv(DATA_PATH, sep=',', encoding='utf-8')
-            df_combined = pd.concat([existing, df_new], ignore_index=True)
+        if not os.path.exists(DATA_PATH) or os.path.getsize(DATA_PATH) == 0:
+            df_new.to_csv(DATA_PATH, index=False, sep=',', encoding='utf-8')
         else:
-            df_combined = df_new
-        # Сохраняем и проверяем успешность
-        try:
-            df_combined.to_csv(DATA_PATH, index=False, sep=',', encoding='utf-8')
-            st.cache_data.clear()
-            # Небольшая задержка, чтобы файл успел записаться
-            import time
-            time.sleep(0.1)
-        except Exception as e:
-            st.error(f"Ошибка записи CSV: {e}")
+            df_new.to_csv(DATA_PATH, mode='a', header=False, index=False, sep=',', encoding='utf-8')
+        st.cache_data.clear()
+        time.sleep(0.1)
 
         # Проверка окончания матча
         if st.session_state.score_me >= 3 or st.session_state.score_opp >= 3:
@@ -324,7 +318,6 @@ elif st.session_state.game_state == 'playing':
             show_cols = ['match_id', 'round', 'opp_move', 'my_move', 'outcome', 'score_me_before', 'score_opp_before']
             available = [c for c in show_cols if c in last_records.columns]
             st.dataframe(last_records[available], use_container_width=True, height=400)
-            # Кнопка скачивания CSV
             if os.path.exists(DATA_PATH):
                 with open(DATA_PATH, 'r', encoding='utf-8') as f:
                     csv_data = f.read()
