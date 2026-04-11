@@ -1,14 +1,14 @@
 import streamlit as st
 import pandas as pd
-import joblib
 import os
 import time
+import json
+from collections import defaultdict, Counter
 
 # ========================
 # Конфигурация
 # ========================
-MODEL_PATH = 'rps_model.pkl'
-TARGET_ENCODER_PATH = 'target_encoder.pkl'
+STATS_FILE = 'rps_markov_stats.json'
 DATA_PATH = 'rps_data.csv'
 
 MOVE_TO_LETTER = {"Камень": "К", "Ножницы": "Н", "Бумага": "Б"}
@@ -17,30 +17,129 @@ OUTCOME_TO_EN = {"Победа": "win", "Поражение": "lose", "Ничь�
 EN_TO_OUTCOME = {v: k for k, v in OUTCOME_TO_EN.items()}
 MOVE_EMOJI = {"Камень": "✊", "Ножницы": "✌️", "Бумага": "✋"}
 
+# Ожидаемые колонки (15)
+EXPECTED_COLS = [
+    'match_id', 'round', 'player_name', 'opp_match_wins', 'opp_match_winrate', 'stake',
+    'opp_move', 'my_move', 'outcome', 'score_me_before', 'score_opp_before',
+    'prev_opp_move', 'prev_outcome', 'streak_draws', 'prev2_opp_move'
+]
+
 # ========================
-# Работа с CSV
+# Марковский предиктор
 # ========================
-def ensure_csv():
-    expected_cols = ['match_id', 'round', 'opp_match_wins', 'opp_match_winrate', 'stake',
-                     'opp_move', 'my_move', 'outcome', 'score_me_before', 'score_opp_before',
-                     'prev_opp_move', 'prev_outcome', 'streak_draws', 'prev2_opp_move']
+class MarkovRPSPredictor:
+    def __init__(self):
+        self.first_move_probs = {'К': 0.33, 'Н': 0.33, 'Б': 0.34}
+        self.transitions = defaultdict(Counter)  # prev_opp -> Counter(next_opp)
+        self.prev_opp_move = None
+
+    def update(self, opp_move):
+        if self.prev_opp_move is not None:
+            self.transitions[self.prev_opp_move][opp_move] += 1
+        self.prev_opp_move = opp_move
+
+    def predict_proba(self):
+        if self.prev_opp_move is None:
+            total = sum(self.first_move_probs.values())
+            return {k: v/total for k, v in self.first_move_probs.items()}
+        counter = self.transitions[self.prev_opp_move]
+        total = sum(counter.values())
+        if total == 0:
+            return {'К': 1/3, 'Н': 1/3, 'Б': 1/3}
+        return {move: counter[move]/total for move in ['К', 'Н', 'Б']}
+
+    def choose_opp_move(self):
+        """Возвращает наиболее вероятный ход противника (для отображения)."""
+        probs = self.predict_proba()
+        return max(probs, key=probs.get)
+
+    def choose_my_move(self):
+        """Возвращает лучший наш ход по EV."""
+        probs = self.predict_proba()
+        pK, pH, pB = probs['К'], probs['Н'], probs['Б']
+        ev = {'К': pH - pB, 'Н': pB - pK, 'Б': pK - pH}
+        return max(ev, key=ev.get)
+
+    def reset_match(self):
+        self.prev_opp_move = None
+
+    def save(self, path):
+        data = {
+            'first_move_probs': self.first_move_probs,
+            'transitions': {k: dict(v) for k, v in self.transitions.items()}
+        }
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def load(self, path):
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                self.first_move_probs = data.get('first_move_probs', self.first_move_probs)
+                self.transitions = defaultdict(Counter)
+                for k, v in data.get('transitions', {}).items():
+                    self.transitions[k] = Counter(v)
+
+# ========================
+# Работа с CSV (исправленная)
+# ========================
+def load_data():
+    """Загружает CSV с приведением типов и добавлением недостающих колонок."""
+    numeric_cols = ['round', 'opp_match_wins', 'opp_match_winrate', 'stake',
+                    'score_me_before', 'score_opp_before', 'streak_draws']
     if not os.path.exists(DATA_PATH):
-        pd.DataFrame(columns=expected_cols).to_csv(DATA_PATH, index=False, sep=',', encoding='utf-8')
-        st.info("Создан новый файл истории.")
+        return pd.DataFrame(columns=EXPECTED_COLS)
+    try:
+        df = pd.read_csv(DATA_PATH, sep=',', encoding='utf-8')
+        # Исправляем возможную опечатку в имени колонки
+        if 'streak_draws' in df.columns and 'streak_draws' not in df.columns:
+            df.rename(columns={'streak_draws': 'streak_draws'}, inplace=True)
+        if 'streak_draws' not in df.columns:
+            df['streak_draws'] = 0
+        # Приведение числовых колонок
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        # Приведение player_name к строке
+        if 'player_name' in df.columns:
+            df['player_name'] = df['player_name'].astype(str).replace('nan', '')
+        else:
+            df['player_name'] = ""
+        # Добавление остальных недостающих колонок
+        missing_cols = [c for c in EXPECTED_COLS if c not in df.columns]
+        for col in missing_cols:
+            if col == 'player_name':
+                df[col] = ""
+            elif col in numeric_cols:
+                df[col] = 0
+            else:
+                df[col] = ""
+        # Приводим порядок
+        df = df[EXPECTED_COLS]
+        return df
+    except pd.errors.ParserError:
+        st.warning("Файл данных повреждён, создаётся новый.")
+        return pd.DataFrame(columns=EXPECTED_COLS)
+
+def ensure_csv():
+    if not os.path.exists(DATA_PATH):
+        pd.DataFrame(columns=EXPECTED_COLS).to_csv(DATA_PATH, index=False, sep=',', encoding='utf-8')
+    else:
+        df = load_data()
+        df.to_csv(DATA_PATH, index=False, sep=',', encoding='utf-8')
 
 def clean_unfinished():
-    """Удаляет из CSV все незавершённые матчи (без 3 побед)."""
-    if not os.path.exists(DATA_PATH):
-        return
-    df = pd.read_csv(DATA_PATH, sep=',', encoding='utf-8')
+    df = load_data()
     if df.empty:
         return
     finished = set()
     for mid in df['match_id'].unique():
         match = df[df['match_id'] == mid]
         for _, row in match.iterrows():
-            if (row['outcome'] == 'win' and row['score_me_before'] + 1 >= 3) or \
-               (row['outcome'] == 'lose' and row['score_opp_before'] + 1 >= 3):
+            score_me = int(row['score_me_before'])
+            score_opp = int(row['score_opp_before'])
+            if (row['outcome'] == 'win' and score_me + 1 >= 3) or \
+               (row['outcome'] == 'lose' and score_opp + 1 >= 3):
                 finished.add(mid)
                 break
     df_clean = df[df['match_id'].isin(finished)]
@@ -49,17 +148,13 @@ def clean_unfinished():
         st.cache_data.clear()
 
 def next_match_id():
-    if not os.path.exists(DATA_PATH):
-        return 1
-    df = pd.read_csv(DATA_PATH, sep=',', encoding='utf-8')
+    df = load_data()
     if df.empty:
         return 1
-    return df['match_id'].max() + 1
+    return int(df['match_id'].max()) + 1
 
 def get_last_n_records(n=10):
-    if not os.path.exists(DATA_PATH):
-        return pd.DataFrame()
-    df = pd.read_csv(DATA_PATH, sep=',', encoding='utf-8')
+    df = load_data()
     if df.empty:
         return df
     df_last = df.tail(n).copy()
@@ -73,30 +168,31 @@ def get_last_n_records(n=10):
     return df_last
 
 # ========================
-# Загрузка модели
+# Инициализация сессии и предиктора
 # ========================
-@st.cache_resource
-def load_model():
-    try:
-        pipeline = joblib.load(MODEL_PATH)
-        le_target = joblib.load(TARGET_ENCODER_PATH)
-        return pipeline, le_target
-    except:
-        st.error("Модель не найдена. Обучите и сохраните rps_model.pkl и target_encoder.pkl")
-        return None, None
+def init_predictor():
+    if 'predictor' not in st.session_state:
+        st.session_state.predictor = MarkovRPSPredictor()
+        st.session_state.predictor.load(STATS_FILE)
+    return st.session_state.predictor
 
-def predict_move(pipeline, le_target, features):
-    inp = pd.DataFrame([features])
-    pred = pipeline.predict(inp)[0]
-    letter = le_target.inverse_transform([pred])[0]
-    move = LETTER_TO_MOVE[letter]
-    beat = {'К': 'Б', 'Н': 'К', 'Б': 'Н'}
-    your = LETTER_TO_MOVE[beat[letter]]
-    return move, your
+def predict_move(predictor, _=None):
+    opp_letter = predictor.choose_opp_move()
+    my_letter = predictor.choose_my_move()
+    return LETTER_TO_MOVE[opp_letter], LETTER_TO_MOVE[my_letter]
 
 # ========================
-# Инициализация сессии
+# Основное приложение
 # ========================
+st.set_page_config(page_title="Помощник в игре Камень - Ножницы - Бумага", layout="wide")
+st.title("🎮 Помощник в игре 'Камень - Ножницы - Бумага'")
+
+ensure_csv()
+predictor = init_predictor()
+
+# ------------------------
+# Состояния сессии
+# ------------------------
 if 'game_state' not in st.session_state:
     st.session_state.game_state = 'setup'
     st.session_state.match_id = None
@@ -109,17 +205,7 @@ if 'game_state' not in st.session_state:
     st.session_state.next_prediction = None
     st.session_state.selected_opp = None
     st.session_state.selected_outcome = None
-
-st.set_page_config(page_title="Помощник в игре Камень - Ножницы - Бумага", layout="wide")
-st.title("🎮 Помощник в игре 'Камень - Ножницы - Бумага'")
-
-# Создаём файл, если его нет (без очистки незавершённых!)
-ensure_csv()
-# НЕ вызываем clean_unfinished() здесь, чтобы не удалять текущий матч
-
-pipeline, le_target = load_model()
-if pipeline is None:
-    st.stop()
+    st.session_state.player_name = ""
 
 # ========================
 # Начало матча
@@ -127,17 +213,18 @@ if pipeline is None:
 if st.session_state.game_state == 'setup':
     st.subheader("Новый матч")
     with st.form("setup"):
-        c1, c2, c3 = st.columns(3)
-        with c1:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            player_name = st.text_input("Имя противника", value="", placeholder="Например, Радушный Спасатель")
+        with col2:
             wins = st.number_input("Побед противника (матчи)", min_value=-1, step=1, value=0)
-        with c2:
+        with col3:
             winrate_percent = st.number_input("Винрейт противника (%)", min_value=-100.0, max_value=100.0, step=0.01, value=50.0)
             winrate = winrate_percent / 100.0
-        with c3:
-            stake = st.selectbox("Ставка", [25, 50, 100])
+        stake = st.selectbox("Ставка", [25, 50, 100])
         if st.form_submit_button("Начать матч"):
-            # Очищаем только старые завершённые матчи (не трогаем текущий)
             clean_unfinished()
+            st.session_state.player_name = player_name if player_name else "Неизвестный"
             st.session_state.opp_stats = {'wins': wins, 'winrate': winrate, 'stake': stake}
             st.session_state.match_id = next_match_id()
             st.session_state.game_state = 'playing'
@@ -148,21 +235,16 @@ if st.session_state.game_state == 'setup':
             st.session_state.streak_draws = 0
             st.session_state.selected_opp = None
             st.session_state.selected_outcome = None
-            feats = {
-                'opp_move': 'К', 'my_move': 'К', 'outcome': 'draw',
-                'prev_opp_move': '-1', 'prev_outcome': 'none', 'prev2_opp_move': '-1',
-                'score_me_before': 0, 'score_opp_before': 0, 'streak_draws': 0,
-                'stake': stake, 'opp_match_wins': wins, 'opp_match_winrate': winrate
-            }
-            pred, your = predict_move(pipeline, le_target, feats)
-            st.session_state.next_prediction = (pred, your)
+            predictor.reset_match()
+            pred_move, your_move = predict_move(predictor)
+            st.session_state.next_prediction = (pred_move, your_move)
             st.rerun()
 
 # ========================
 # Игровой процесс
 # ========================
 elif st.session_state.game_state == 'playing':
-    st.info(f"Счёт: **{st.session_state.score_me} : {st.session_state.score_opp}** | Раунд {st.session_state.round_num} | Матч #{st.session_state.match_id}")
+    st.info(f"Счёт: **{st.session_state.score_me} : {st.session_state.score_opp}** | Раунд {st.session_state.round_num} | Матч #{st.session_state.match_id} | Противник: {st.session_state.player_name}")
 
     if st.session_state.next_prediction:
         pred_move, your_move = st.session_state.next_prediction
@@ -176,15 +258,15 @@ elif st.session_state.game_state == 'playing':
     opp_type_b = "primary" if st.session_state.selected_opp == "Бумага" else "secondary"
 
     with col1:
-        if st.button("✌️ Ножницы", key="opp_n", width='stretch', type=opp_type_n):
+        if st.button("✌️ Ножницы", key="opp_n", use_container_width=True, type=opp_type_n):
             st.session_state.selected_opp = "Ножницы"
             st.rerun()
     with col2:
-        if st.button("✊ Камень", key="opp_k", width='stretch', type=opp_type_k):
+        if st.button("✊ Камень", key="opp_k", use_container_width=True, type=opp_type_k):
             st.session_state.selected_opp = "Камень"
             st.rerun()
     with col3:
-        if st.button("✋ Бумага", key="opp_b", width='stretch', type=opp_type_b):
+        if st.button("✋ Бумага", key="opp_b", use_container_width=True, type=opp_type_b):
             st.session_state.selected_opp = "Бумага"
             st.rerun()
 
@@ -195,20 +277,20 @@ elif st.session_state.game_state == 'playing':
     out_type_w = "primary" if st.session_state.selected_outcome == "Победа" else "secondary"
 
     with col4:
-        if st.button("😞 Поражение", key="out_l", width='stretch', type=out_type_l):
+        if st.button("😞 Поражение", key="out_l", use_container_width=True, type=out_type_l):
             st.session_state.selected_outcome = "Поражение"
             st.rerun()
     with col5:
-        if st.button("🤝 Ничья", key="out_d", width='stretch', type=out_type_d):
+        if st.button("🤝 Ничья", key="out_d", use_container_width=True, type=out_type_d):
             st.session_state.selected_outcome = "Ничья"
             st.rerun()
     with col6:
-        if st.button("😊 Победа", key="out_w", width='stretch', type=out_type_w):
+        if st.button("😊 Победа", key="out_w", use_container_width=True, type=out_type_w):
             st.session_state.selected_outcome = "Победа"
             st.rerun()
 
     next_round_disabled = (st.session_state.selected_opp is None or st.session_state.selected_outcome is None)
-    if st.button("➡️ Записать раунд и предсказать следующий", width='stretch', disabled=next_round_disabled):
+    if st.button("➡️ Записать раунд и предсказать следующий", use_container_width=True, disabled=next_round_disabled):
         opp_move_full = st.session_state.selected_opp
         outcome_ru = st.session_state.selected_outcome
         opp_letter = MOVE_TO_LETTER[opp_move_full]
@@ -230,6 +312,7 @@ elif st.session_state.game_state == 'playing':
         new_row = {
             'match_id': st.session_state.match_id,
             'round': st.session_state.round_num,
+            'player_name': st.session_state.player_name,
             'opp_match_wins': st.session_state.opp_stats['wins'],
             'opp_match_winrate': st.session_state.opp_stats['winrate'],
             'stake': st.session_state.opp_stats['stake'],
@@ -245,7 +328,8 @@ elif st.session_state.game_state == 'playing':
         }
         st.session_state.history.append(new_row)
 
-        # Обновление счёта
+        predictor.update(opp_letter)
+
         if outcome == 'win':
             st.session_state.score_me += 1
             st.session_state.streak_draws = 0
@@ -255,7 +339,6 @@ elif st.session_state.game_state == 'playing':
         else:
             st.session_state.streak_draws += 1
 
-        # Запись в CSV (добавление строки)
         df_new = pd.DataFrame([new_row])
         if not os.path.exists(DATA_PATH) or os.path.getsize(DATA_PATH) == 0:
             df_new.to_csv(DATA_PATH, index=False, sep=',', encoding='utf-8')
@@ -264,38 +347,21 @@ elif st.session_state.game_state == 'playing':
         st.cache_data.clear()
         time.sleep(0.1)
 
-        # Проверка окончания матча
         if st.session_state.score_me >= 3 or st.session_state.score_opp >= 3:
             st.session_state.game_state = 'finished'
             st.session_state.next_prediction = None
+            predictor.save(STATS_FILE)
             st.success(f"🏆 Матч #{st.session_state.match_id} окончен! Счёт {st.session_state.score_me}:{st.session_state.score_opp}")
             st.rerun()
 
-        # Предсказание следующего раунда
-        feats = {
-            'opp_move': opp_letter,
-            'my_move': my_letter,
-            'outcome': outcome,
-            'prev_opp_move': prev_opp,
-            'prev_outcome': prev_out,
-            'prev2_opp_move': prev2_opp,
-            'score_me_before': st.session_state.score_me,
-            'score_opp_before': st.session_state.score_opp,
-            'streak_draws': st.session_state.streak_draws,
-            'stake': st.session_state.opp_stats['stake'],
-            'opp_match_wins': st.session_state.opp_stats['wins'],
-            'opp_match_winrate': st.session_state.opp_stats['winrate']
-        }
-        pred, your = predict_move(pipeline, le_target, feats)
-        st.session_state.next_prediction = (pred, your)
+        pred_move, your_move = predict_move(predictor)
+        st.session_state.next_prediction = (pred_move, your_move)
 
-        # Сброс выбора
         st.session_state.selected_opp = None
         st.session_state.selected_outcome = None
         st.session_state.round_num += 1
         st.rerun()
 
-    # Две колонки: ходы противника и последние записи
     col_left, col_right = st.columns(2)
     with col_left:
         st.markdown("---")
@@ -315,7 +381,7 @@ elif st.session_state.game_state == 'playing':
         st.subheader("📋 Последние 10 сохранённых раундов")
         last_records = get_last_n_records(10)
         if not last_records.empty:
-            show_cols = ['match_id', 'round', 'opp_move', 'my_move', 'outcome', 'score_me_before', 'score_opp_before']
+            show_cols = ['match_id', 'round', 'player_name', 'opp_move', 'my_move', 'outcome', 'score_me_before', 'score_opp_before']
             available = [c for c in show_cols if c in last_records.columns]
             st.dataframe(last_records[available], use_container_width=True, height=400)
             if os.path.exists(DATA_PATH):
@@ -329,8 +395,8 @@ elif st.session_state.game_state == 'playing':
 # Завершение матча
 # ========================
 elif st.session_state.game_state == 'finished':
-    st.info(f"Итоговый счёт матча #{st.session_state.match_id}: {st.session_state.score_me} : {st.session_state.score_opp}")
-    if st.button("➕ Начать новый матч", width='stretch'):
+    st.info(f"Итоговый счёт матча #{st.session_state.match_id}: {st.session_state.score_me} : {st.session_state.score_opp} | Противник: {st.session_state.player_name}")
+    if st.button("➕ Начать новый матч", use_container_width=True):
         clean_unfinished()
         st.session_state.game_state = 'setup'
         st.session_state.history = []
