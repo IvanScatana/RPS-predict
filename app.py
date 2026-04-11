@@ -90,7 +90,7 @@ if 'game_state' not in st.session_state:
     st.session_state.selected_opp = None
     st.session_state.selected_outcome = None
 
-st.set_page_config(page_title="RPS Predictor", layout="centered")
+st.set_page_config(page_title="Помощник в игре Камень - Ножницы - Бумага", layout="centered")
 st.title("🎮 Предсказатель хода в 'Камень-Ножницы-Бумага'")
 
 ensure_csv()
@@ -146,7 +146,7 @@ elif st.session_state.game_state == 'playing':
 
     st.subheader("Выберите ход противника и исход раунда")
 
-    # Кнопки для хода противника
+    # Кнопки для хода противника (синее выделение при выборе)
     col1, col2, col3 = st.columns(3)
     opp_type_n = "primary" if st.session_state.selected_opp == "Ножницы" else "secondary"
     opp_type_k = "primary" if st.session_state.selected_opp == "Камень" else "secondary"
@@ -185,7 +185,7 @@ elif st.session_state.game_state == 'playing':
             st.session_state.selected_outcome = "Победа"
             st.rerun()
 
-    # Кнопка "Следующий раунд"
+    # Кнопка "Следующий раунд" (активна только если оба выбраны)
     next_round_disabled = (st.session_state.selected_opp is None or st.session_state.selected_outcome is None)
     if st.button("➡️ Записать раунд и предсказать следующий", use_container_width=True, disabled=next_round_disabled):
         opp_move_full = st.session_state.selected_opp
@@ -289,24 +289,12 @@ elif st.session_state.game_state == 'finished':
         st.rerun()
 
 # ========================
-# История и скачивание
+# Кнопка скачивания CSV (дополнительно, можно оставить)
 # ========================
-with st.expander("📜 История сохранённых раундов (завершённые матчи)"):
+with st.expander("💾 Скачать историю (CSV)"):
     if os.path.exists(DATA_PATH):
-        df_view = pd.read_csv(DATA_PATH, sep=',', encoding='utf-8')
-        if not df_view.empty:
-            df_disp = df_view.copy()
-            for col in ['opp_move', 'my_move', 'prev_opp_move', 'prev2_opp_move']:
-                if col in df_disp.columns:
-                    df_disp[col] = df_disp[col].map(lambda x: LETTER_TO_MOVE.get(x, x))
-            if 'outcome' in df_disp.columns:
-                df_disp['outcome'] = df_disp['outcome'].map(EN_TO_OUTCOME)
-            if 'prev_outcome' in df_disp.columns:
-                df_disp['prev_outcome'] = df_disp['prev_outcome'].map(lambda x: EN_TO_OUTCOME.get(x, x))
-            st.dataframe(df_disp.tail(20))
-            csv_data = df_view.to_csv(index=False, sep=',', encoding='utf-8')
-            st.download_button("💾 Скачать CSV", data=csv_data, file_name="rps_data.csv", mime="text/csv")
-        else:
-            st.write("Нет сохранённых данных.")
+        with open(DATA_PATH, 'r', encoding='utf-8') as f:
+            csv_data = f.read()
+        st.download_button("📥 Скачать rps_data.csv", data=csv_data, file_name="rps_data.csv", mime="text/csv")
     else:
-        st.write("Файл истории не найден.")
+        st.write("Файл ещё не создан.")
