@@ -13,7 +13,6 @@ import joblib
 # ========================
 # Конфигурация
 # ========================
-STATS_FILE = 'rps_markov_stats.json'  # не используется, оставлен для совместимости
 DATA_PATH = 'rps_data.csv'
 MODEL_PATH = 'catboost_model.pkl'
 PREPROCESSOR_PATH = 'rps_preprocessor.pkl'
@@ -24,13 +23,15 @@ OUTCOME_TO_EN = {"Победа": "win", "Поражение": "lose", "Ничь�
 EN_TO_OUTCOME = {v: k for k, v in OUTCOME_TO_EN.items()}
 MOVE_EMOJI = {"Камень": "✊", "Ножницы": "✌️", "Бумага": "✋"}
 
-# Ожидаемые колонки (добавлена score_diff)
+# Ожидаемые колонки (полный список)
 EXPECTED_COLS = [
     'match_id', 'round', 'player_name', 'win_category',
     'opp_match_wins', 'opp_match_winrate', 'stake',
     'opp_move', 'my_move', 'outcome',
     'score_me_before', 'score_opp_before', 'score_diff', 'streak_draws',
-    'prev_opp_move', 'prev_outcome', 'prev2_opp_move', 'prev2_outcome'
+    'prev_opp_move', 'prev_my_move', 'prev_outcome',
+    'prev2_opp_move', 'prev2_my_move', 'prev2_outcome',
+    'is_last_round'
 ]
 
 # ========================
@@ -52,7 +53,6 @@ def compute_win_category(wins):
 # Статистические функции для раундов 1-3
 # ========================
 def get_move_r1(stake, df):
-    """Возвращает оптимальный ход в первом раунде на основе статистики."""
     sub = df[(df["round"] == 1) & (df["stake"] == stake)]
     if len(sub) == 0:
         return 'К'
@@ -71,7 +71,6 @@ def get_move_r1(stake, df):
         return 'Б'
 
 def prepare_prob_r2(df):
-    """Строит таблицу вероятностей для второго раунда."""
     df_r2 = df[df['round'] == 2].copy()
     if df_r2.empty:
         return pd.DataFrame()
@@ -79,7 +78,6 @@ def prepare_prob_r2(df):
                  .value_counts(normalize=True).reset_index(name='prob')
 
 def get_move_r2(stake, outcome_r1, my_move_r1, opp_move_r1, prob_r2):
-    """Возвращает ход во втором раунде или None, если нет данных."""
     if prob_r2.empty:
         return None
     mask = (prob_r2['stake'] == stake) & \
@@ -103,7 +101,6 @@ def get_move_r2(stake, outcome_r1, my_move_r1, opp_move_r1, prob_r2):
         return 'Б'
 
 def prepare_prob_r3(df):
-    """Строит таблицу вероятностей для третьего раунда."""
     df_r3 = df[df['round'] == 3].copy()
     if df_r3.empty:
         return pd.DataFrame()
@@ -139,7 +136,7 @@ def get_move_r3(stake, outcome_r2, my_move_r2, opp_move_r2,
         return 'Б'
 
 # ========================
-# Загрузка модели ML
+# Загрузка ML модели
 # ========================
 def load_ml_model():
     if os.path.exists(MODEL_PATH) and os.path.exists(PREPROCESSOR_PATH):
@@ -152,18 +149,15 @@ def load_ml_model():
     return None, None
 
 def get_move_ml(features, model, preprocessor):
-    """Предсказание хода через ML модель (раунд >=4)."""
     if model is None or preprocessor is None:
         return None
     X = pd.DataFrame([features])
     X_processed = preprocessor.transform(X)
     pred = model.predict(X_processed)
-    # Извлекаем скаляр (число или строка)
     if isinstance(pred, np.ndarray):
         pred_code = pred.item() if pred.size == 1 else pred[0]
     else:
         pred_code = pred
-    # Если строка, то это уже ход
     if pred_code in ('К', 'Н', 'Б'):
         predicted_opp = pred_code
     else:
@@ -178,9 +172,8 @@ def get_move_ml(features, model, preprocessor):
 # Работа с CSV
 # ========================
 def load_data():
-    """Загружает CSV с приведением типов и вычислением score_diff."""
     numeric_cols = ['round', 'opp_match_wins', 'opp_match_winrate', 'stake',
-                    'score_me_before', 'score_opp_before', 'streak_draws']
+                    'score_me_before', 'score_opp_before', 'streak_draws', 'is_last_round']
     if not os.path.exists(DATA_PATH):
         return pd.DataFrame(columns=EXPECTED_COLS)
     try:
@@ -203,8 +196,8 @@ def load_data():
                     continue
                 elif col in numeric_cols:
                     df[col] = 0
-                elif col in ['prev_outcome', 'prev2_outcome']:
-                    df[col] = 'none'
+                elif col in ['prev_outcome', 'prev2_outcome', 'prev_my_move', 'prev2_my_move']:
+                    df[col] = '-1'
                 else:
                     df[col] = ""
         # Вычисляем win_category
@@ -256,7 +249,6 @@ def get_last_n_records(n=10):
     if df.empty:
         return df
     df_last = df.tail(n).copy()
-    # Преобразование буквенных ходов в названия
     for col in ['opp_move', 'my_move', 'prev_opp_move', 'prev2_opp_move']:
         if col in df_last.columns:
             df_last[col] = df_last[col].map(lambda x: LETTER_TO_MOVE.get(x, x))
@@ -292,8 +284,8 @@ def init_session():
         st.session_state.prob_r3 = prepare_prob_r3(df_full)
         # Загружаем ML модель
         st.session_state.ml_model, st.session_state.ml_preprocessor = load_ml_model()
-    # Обновляем статистические таблицы при каждом запуске (если данные изменились)
     else:
+        # Обновляем статистические таблицы при каждом запуске (если данные изменились)
         df_full = load_data()
         st.session_state.df_full = df_full
         st.session_state.prob_r2 = prepare_prob_r2(df_full)
@@ -338,9 +330,7 @@ if st.session_state.game_state == 'setup':
             st.session_state.selected_outcome = None
             # Предсказание первого раунда
             best_move = get_move_r1(stake, st.session_state.df_full)
-            st.session_state.next_prediction = (LETTER_TO_MOVE[best_move], LETTER_TO_MOVE[best_move])  # (opp, my) но для 1 раунда my = opp? Нет, в предсказании мы показываем ход противника и свой ход. Лучше показать свой ход.
-            # Переделаем: предсказание — это мой ход
-            st.session_state.next_prediction = (LETTER_TO_MOVE[best_move], LETTER_TO_MOVE[best_move])  # временно, но в интерфейсе показывается pred_move и ваш ход. Сделаем единообразно.
+            st.session_state.next_prediction = (LETTER_TO_MOVE[best_move], LETTER_TO_MOVE[best_move])
             st.rerun()
 
 # ========================
@@ -408,12 +398,18 @@ elif st.session_state.game_state == 'playing':
         else:
             my_letter = opp_letter
 
+        # Данные предыдущих раундов
         prev_opp = st.session_state.history[-1]['opp_move'] if st.session_state.history else '-1'
+        prev_my = st.session_state.history[-1]['my_move'] if st.session_state.history else '-1'
         prev_out = st.session_state.history[-1]['outcome'] if st.session_state.history else 'none'
         prev2_opp = st.session_state.history[-2]['opp_move'] if len(st.session_state.history) >= 2 else '-1'
+        prev2_my = st.session_state.history[-2]['my_move'] if len(st.session_state.history) >= 2 else '-1'
         prev2_out = st.session_state.history[-2]['outcome'] if len(st.session_state.history) >= 2 else 'none'
 
+        # Вычисляем win_category
         win_cat = compute_win_category(st.session_state.opp_stats['wins'])
+        # Вычисляем is_last_round (до начала текущего раунда)
+        is_last_round = 1 if (st.session_state.score_me == 2 or st.session_state.score_opp == 2) else 0
 
         new_row = {
             'match_id': st.session_state.match_id,
@@ -431,9 +427,12 @@ elif st.session_state.game_state == 'playing':
             'score_diff': st.session_state.score_me - st.session_state.score_opp,
             'streak_draws': st.session_state.streak_draws,
             'prev_opp_move': prev_opp,
+            'prev_my_move': prev_my,
             'prev_outcome': prev_out,
             'prev2_opp_move': prev2_opp,
-            'prev2_outcome': prev2_out
+            'prev2_my_move': prev2_my,
+            'prev2_outcome': prev2_out,
+            'is_last_round': is_last_round
         }
         st.session_state.history.append(new_row)
 
@@ -465,22 +464,17 @@ elif st.session_state.game_state == 'playing':
 
         # --- ПРЕДСКАЗАНИЕ СЛЕДУЮЩЕГО РАУНДА ---
         next_round_num = st.session_state.round_num + 1
-        # Определяем стратегию в зависимости от номера следующего раунда
         if next_round_num == 1:
-            # не может быть, но на всякий случай
             best_move = get_move_r1(st.session_state.opp_stats['stake'], st.session_state.df_full)
             pred_my = best_move
-            pred_opp = best_move  # не используется
         elif next_round_num == 2:
-            # нужны данные первого раунда
-            r1 = st.session_state.history[0]  # первый раунд уже записан
+            r1 = st.session_state.history[0]
             best = get_move_r2(st.session_state.opp_stats['stake'],
                                r1['outcome'], r1['my_move'], r1['opp_move'],
                                st.session_state.prob_r2)
             if best is None:
                 best = get_move_r1(st.session_state.opp_stats['stake'], st.session_state.df_full)
             pred_my = best
-            pred_opp = best
         elif next_round_num == 3:
             r1 = st.session_state.history[0]
             r2 = st.session_state.history[1]
@@ -489,18 +483,14 @@ elif st.session_state.game_state == 'playing':
                                r1['outcome'], r1['my_move'], r1['opp_move'],
                                st.session_state.prob_r3)
             if best is None:
-                # fallback на r2
                 best = get_move_r2(st.session_state.opp_stats['stake'],
                                    r2['outcome'], r2['my_move'], r2['opp_move'],
                                    st.session_state.prob_r2)
                 if best is None:
                     best = get_move_r1(st.session_state.opp_stats['stake'], st.session_state.df_full)
             pred_my = best
-            pred_opp = best
         else:  # >=4
-            # Используем ML, если модель есть
             if st.session_state.ml_model is not None:
-                # Берём текущий раунд (последний в истории) как основу для предсказания следующего
                 curr = st.session_state.history[-1]
                 features = {
                     'round': curr['round'],
@@ -524,7 +514,6 @@ elif st.session_state.game_state == 'playing':
                 }
                 best = get_move_ml(features, st.session_state.ml_model, st.session_state.ml_preprocessor)
                 if best is None:
-                    # fallback на r3
                     r1 = st.session_state.history[0]
                     r2 = st.session_state.history[1]
                     best = get_move_r3(st.session_state.opp_stats['stake'],
@@ -534,7 +523,6 @@ elif st.session_state.game_state == 'playing':
                     if best is None:
                         best = get_move_r1(st.session_state.opp_stats['stake'], st.session_state.df_full)
             else:
-                # ML нет, используем r3
                 r1 = st.session_state.history[0]
                 r2 = st.session_state.history[1]
                 best = get_move_r3(st.session_state.opp_stats['stake'],
@@ -544,8 +532,7 @@ elif st.session_state.game_state == 'playing':
                 if best is None:
                     best = get_move_r1(st.session_state.opp_stats['stake'], st.session_state.df_full)
             pred_my = best
-            pred_opp = best  # для отображения в предсказании показываем и ход противника? В интерфейсе ожидается (pred_move, your_move). Так как мы предсказываем свой ход, то pred_move можно сделать таким же.
-        # Сохраняем предсказание
+
         st.session_state.next_prediction = (LETTER_TO_MOVE[pred_my], LETTER_TO_MOVE[pred_my])
         st.session_state.round_num = next_round_num
         st.session_state.selected_opp = None
