@@ -3,14 +3,11 @@ import pandas as pd
 import numpy as np
 import os
 import time
-import joblib
 
 # ========================
 # Конфигурация
 # ========================
 DATA_PATH = 'rps_data.csv'
-MODEL_PATH = 'catboost_model.pkl'
-PREPROCESSOR_PATH = 'rps_preprocessor.pkl'
 
 MOVE_TO_LETTER = {"Камень": "К", "Ножницы": "Н", "Бумага": "Б"}
 LETTER_TO_MOVE = {v: k for k, v in MOVE_TO_LETTER.items()}
@@ -18,7 +15,8 @@ OUTCOME_TO_EN = {"Победа": "win", "Поражение": "lose", "Ничь�
 EN_TO_OUTCOME = {v: k for k, v in OUTCOME_TO_EN.items()}
 MOVE_EMOJI = {"Камень": "✊", "Ножницы": "✌️", "Бумага": "✋"}
 
-EXPECTED_COLS = [
+# Базовый список колонок (динамически дополняется при необходимости)
+BASE_COLS = [
     'match_id', 'round', 'player_name', 'win_category',
     'opp_match_wins', 'opp_match_winrate', 'stake',
     'opp_move', 'my_move', 'outcome',
@@ -27,6 +25,11 @@ EXPECTED_COLS = [
     'prev2_opp_move', 'prev2_my_move', 'prev2_outcome',
     'is_last_round'
 ]
+# Дополнительные колонки для глубины 3-6
+EXTRA_COLS = []
+for shift in [3,4,5,6]:
+    EXTRA_COLS.extend([f'prev{shift}_opp_move', f'prev{shift}_my_move', f'prev{shift}_outcome'])
+EXPECTED_COLS = BASE_COLS + EXTRA_COLS
 
 # ========================
 # Вспомогательные функции
@@ -46,16 +49,27 @@ def compute_win_category(wins):
 def counter_move(move):
     return {'К': 'Б', 'Н': 'К', 'Б': 'Н'}.get(move, 'К')
 
-# -------------------- Статистика для раундов 1-3 --------------------
-# 1-й раунд: оптимальный ход (максимизация ожидаемого выигрыша)
-def get_optimal_move_r1(stake, df):
-    sub = df[(df["round"] == 1) & (df["stake"] == stake)]
+def get_outcome(my_move, opp_move):
+    if my_move == opp_move:
+        return 'draw'
+    if (my_move == 'К' and opp_move == 'Н') or (my_move == 'Н' and opp_move == 'Б') or (my_move == 'Б' and opp_move == 'К'):
+        return 'win'
+    return 'loss'
+
+# -------------------- Функции для раундов 1-7 (комбинированные stake+win_category) --------------------
+def get_optimal_move_r1(stake, win_category, df):
+    sub = df[(df["round"] == 1) & (df["stake"] == stake) & (df["win_category"] == win_category)]
     if len(sub) == 0:
-        return 'К'
+        sub = df[(df["round"] == 1) & (df["win_category"] == win_category)]
+        if len(sub) == 0:
+            sub = df[(df["round"] == 1) & (df["stake"] == stake)]
+            if len(sub) == 0:
+                return 'К'
     counts = sub["opp_move"].value_counts()
-    p_k = counts.get('К', 0) / len(sub)
-    p_n = counts.get('Н', 0) / len(sub)
-    p_b = counts.get('Б', 0) / len(sub)
+    total = len(sub)
+    p_k = counts.get('К', 0) / total
+    p_n = counts.get('Н', 0) / total
+    p_b = counts.get('Б', 0) / total
     exp_k = p_n - p_b
     exp_n = p_b - p_k
     exp_b = p_k - p_n
@@ -66,31 +80,44 @@ def get_optimal_move_r1(stake, df):
     else:
         return 'Б'
 
-# 1-й раунд: наиболее вероятный ход противника (для информации)
-def get_most_probable_opp_r1(stake, df):
-    sub = df[(df["round"] == 1) & (df["stake"] == stake)]
+def get_most_probable_opp_r1(stake, win_category, df):
+    sub = df[(df["round"] == 1) & (df["stake"] == stake) & (df["win_category"] == win_category)]
     if len(sub) == 0:
-        return 'К'
+        sub = df[(df["round"] == 1) & (df["win_category"] == win_category)]
+        if len(sub) == 0:
+            sub = df[(df["round"] == 1) & (df["stake"] == stake)]
+            if len(sub) == 0:
+                return 'К'
     counts = sub["opp_move"].value_counts()
     return counts.idxmax() if not counts.empty else 'К'
 
-# Подготовка вероятностей для 2-го раунда
-def prepare_prob_r2(df):
-    df_r2 = df[df['round'] == 2].copy()
-    if df_r2.empty:
+# Обобщённая функция подготовки вероятностей для раунда r (2..7)
+def prepare_prob_r(df, round_num):
+    df_r = df[df['round'] == round_num].copy()
+    if df_r.empty:
         return pd.DataFrame()
-    return df_r2.groupby(['stake', 'prev_outcome', 'prev_my_move', 'prev_opp_move'])['opp_move'] \
-                 .value_counts(normalize=True).reset_index(name='prob')
+    # Список колонок для группировки: stake, win_category и prev... до round_num-1
+    group_cols = ['stake', 'win_category']
+    for i in range(1, round_num):
+        group_cols.append(f'prev{i}_outcome')
+        group_cols.append(f'prev{i}_my_move')
+        group_cols.append(f'prev{i}_opp_move')
+    return df_r.groupby(group_cols)['opp_move'].value_counts(normalize=True).reset_index(name='prob')
 
-# Оптимальный ход во 2-м раунде (максимизация ожидаемого выигрыша)
-def get_optimal_move_r2(stake, outcome_r1, my_move_r1, opp_move_r1, prob_r2):
-    if prob_r2.empty:
+def get_optimal_move_r(stake, win_category, outcomes, my_moves, opp_moves, prob_r):
+    """
+    outcomes, my_moves, opp_moves - списки от последнего (предыдущий раунд) до первого
+    для round_num = len(outcomes)+1
+    """
+    if prob_r.empty:
         return None
-    mask = (prob_r2['stake'] == stake) & \
-           (prob_r2['prev_outcome'] == outcome_r1) & \
-           (prob_r2['prev_my_move'] == my_move_r1) & \
-           (prob_r2['prev_opp_move'] == opp_move_r1)
-    subset = prob_r2[mask]
+    mask = (prob_r['stake'] == stake) & (prob_r['win_category'] == win_category)
+    # Добавляем условия для каждого предыдущего раунда
+    for i, (outc, my_m, opp_m) in enumerate(zip(outcomes, my_moves, opp_moves), start=1):
+        mask &= (prob_r[f'prev{i}_outcome'] == outc) & \
+                (prob_r[f'prev{i}_my_move'] == my_m) & \
+                (prob_r[f'prev{i}_opp_move'] == opp_m)
+    subset = prob_r[mask]
     if len(subset) == 0:
         return None
     p_k = subset[subset['opp_move'] == 'К']['prob'].sum()
@@ -106,103 +133,44 @@ def get_optimal_move_r2(stake, outcome_r1, my_move_r1, opp_move_r1, prob_r2):
     else:
         return 'Б'
 
-# Наиболее вероятный ход противника во 2-м раунде (для информации)
-def get_most_probable_opp_r2(stake, outcome_r1, my_move_r1, opp_move_r1, prob_r2):
+# Специфические функции для каждого раунда (для удобства вызова)
+def get_optimal_move_r2(stake, win_category, outc1, my1, opp1, prob_r2, df_full):
+    return get_optimal_move_r(stake, win_category, [outc1], [my1], [opp1], prob_r2)
+def get_optimal_move_r3(stake, win_category, outc2, my2, opp2, outc1, my1, opp1, prob_r3, df_full):
+    return get_optimal_move_r(stake, win_category, [outc2, outc1], [my2, my1], [opp2, opp1], prob_r3)
+def get_optimal_move_r4(stake, win_category, outc3, my3, opp3, outc2, my2, opp2, outc1, my1, opp1, prob_r4):
+    return get_optimal_move_r(stake, win_category, [outc3, outc2, outc1], [my3, my2, my1], [opp3, opp2, opp1], prob_r4)
+def get_optimal_move_r5(stake, win_category, outc4, my4, opp4, outc3, my3, opp3, outc2, my2, opp2, outc1, my1, opp1, prob_r5):
+    return get_optimal_move_r(stake, win_category, [outc4, outc3, outc2, outc1], [my4, my3, my2, my1], [opp4, opp3, opp2, opp1], prob_r5)
+def get_optimal_move_r6(stake, win_category, outc5, my5, opp5, outc4, my4, opp4, outc3, my3, opp3, outc2, my2, opp2, outc1, my1, opp1, prob_r6):
+    return get_optimal_move_r(stake, win_category, [outc5, outc4, outc3, outc2, outc1], [my5, my4, my3, my2, my1], [opp5, opp4, opp3, opp2, opp1], prob_r6)
+def get_optimal_move_r7(stake, win_category, outc6, my6, opp6, outc5, my5, opp5, outc4, my4, opp4, outc3, my3, opp3, outc2, my2, opp2, outc1, my1, opp1, prob_r7):
+    return get_optimal_move_r(stake, win_category, [outc6, outc5, outc4, outc3, outc2, outc1], [my6, my5, my4, my3, my2, my1], [opp6, opp5, opp4, opp3, opp2, opp1], prob_r7)
+
+# Функции для наиболее вероятного хода противника (для отображения) – упрощённо, можно использовать те же с exp, но для простоты используем mode
+def get_most_probable_opp_r1(stake, win_category, df):
+    sub = df[(df["round"] == 1) & (df["stake"] == stake) & (df["win_category"] == win_category)]
+    if len(sub) == 0:
+        sub = df[(df["round"] == 1) & (df["win_category"] == win_category)]
+        if len(sub) == 0:
+            sub = df[(df["round"] == 1) & (df["stake"] == stake)]
+            if len(sub) == 0:
+                return 'К'
+    return sub['opp_move'].mode()[0] if not sub.empty else 'К'
+
+def get_most_probable_opp_r2(stake, win_category, outc1, my1, opp1, prob_r2):
     if prob_r2.empty:
         return None
-    mask = (prob_r2['stake'] == stake) & \
-           (prob_r2['prev_outcome'] == outcome_r1) & \
-           (prob_r2['prev_my_move'] == my_move_r1) & \
-           (prob_r2['prev_opp_move'] == opp_move_r1)
+    mask = (prob_r2['stake'] == stake) & (prob_r2['win_category'] == win_category) & \
+           (prob_r2['prev_outcome'] == outc1) & (prob_r2['prev_my_move'] == my1) & (prob_r2['prev_opp_move'] == opp1)
     subset = prob_r2[mask]
     if len(subset) == 0:
         return None
     grouped = subset.groupby('opp_move')['prob'].sum()
     return grouped.idxmax() if not grouped.empty else None
 
-# Подготовка вероятностей для 3-го раунда
-def prepare_prob_r3(df):
-    df_r3 = df[df['round'] == 3].copy()
-    if df_r3.empty:
-        return pd.DataFrame()
-    return df_r3.groupby(['stake', 'prev_outcome', 'prev_my_move', 'prev_opp_move',
-                          'prev2_outcome', 'prev2_my_move', 'prev2_opp_move'])['opp_move'] \
-                 .value_counts(normalize=True).reset_index(name='prob')
-
-# Оптимальный ход в 3-м раунде
-def get_optimal_move_r3(stake, outcome_r2, my_move_r2, opp_move_r2,
-                        outcome_r1, my_move_r1, opp_move_r1, prob_r3):
-    if prob_r3.empty:
-        return None
-    mask = (prob_r3['stake'] == stake) & \
-           (prob_r3['prev_outcome'] == outcome_r2) & \
-           (prob_r3['prev_my_move'] == my_move_r2) & \
-           (prob_r3['prev_opp_move'] == opp_move_r2) & \
-           (prob_r3['prev2_outcome'] == outcome_r1) & \
-           (prob_r3['prev2_my_move'] == my_move_r1) & \
-           (prob_r3['prev2_opp_move'] == opp_move_r1)
-    subset = prob_r3[mask]
-    if len(subset) == 0:
-        return None
-    p_k = subset[subset['opp_move'] == 'К']['prob'].sum()
-    p_n = subset[subset['opp_move'] == 'Н']['prob'].sum()
-    p_b = subset[subset['opp_move'] == 'Б']['prob'].sum()
-    exp_k = p_n - p_b
-    exp_n = p_b - p_k
-    exp_b = p_k - p_n
-    if exp_k >= exp_n and exp_k >= exp_b:
-        return 'К'
-    elif exp_n >= exp_b:
-        return 'Н'
-    else:
-        return 'Б'
-
-# Наиболее вероятный ход противника в 3-м раунде
-def get_most_probable_opp_r3(stake, outcome_r2, my_move_r2, opp_move_r2,
-                             outcome_r1, my_move_r1, opp_move_r1, prob_r3):
-    if prob_r3.empty:
-        return None
-    mask = (prob_r3['stake'] == stake) & \
-           (prob_r3['prev_outcome'] == outcome_r2) & \
-           (prob_r3['prev_my_move'] == my_move_r2) & \
-           (prob_r3['prev_opp_move'] == opp_move_r2) & \
-           (prob_r3['prev2_outcome'] == outcome_r1) & \
-           (prob_r3['prev2_my_move'] == my_move_r1) & \
-           (prob_r3['prev2_opp_move'] == opp_move_r1)
-    subset = prob_r3[mask]
-    if len(subset) == 0:
-        return None
-    grouped = subset.groupby('opp_move')['prob'].sum()
-    return grouped.idxmax() if not grouped.empty else None
-
-# -------------------- ML для раундов >=4 --------------------
-def load_ml_model():
-    if os.path.exists(MODEL_PATH) and os.path.exists(PREPROCESSOR_PATH):
-        try:
-            model = joblib.load(MODEL_PATH)
-            preprocessor = joblib.load(PREPROCESSOR_PATH)
-            return model, preprocessor
-        except Exception as e:
-            st.warning(f"Не удалось загрузить ML-модель: {e}")
-    return None, None
-
-def predict_opp_ml_with_proba(features, model, preprocessor):
-    """Возвращает (предсказанный_ход_противника, уверенность)"""
-    if model is None or preprocessor is None:
-        return None, 0.0
-    X = pd.DataFrame([features])
-    X_processed = preprocessor.transform(X)
-    pred_proba = model.predict_proba(X_processed)[0]
-    pred_code = model.predict(X_processed)[0]
-    if isinstance(pred_code, np.ndarray):
-        pred_code = pred_code.item()
-    if pred_code in ('К','Н','Б'):
-        pred_opp = pred_code
-    else:
-        move_map = {0:'К',1:'Н',2:'Б'}
-        pred_opp = move_map.get(pred_code, 'К')
-    confidence = max(pred_proba)
-    return pred_opp, confidence
+# Аналогично для r3..r7 можно сделать, но для простоты в предсказании для раундов 1-3 будем использовать get_most_probable_opp_r1..r3, а для 4-7 можно не показывать наиболее вероятный ход противника (или показывать тот же, что и оптимальный)
+# Чтобы не усложнять, для раундов >=4 будем показывать только оптимальный ход (без отдельного "наиболее вероятный противник")
 
 # -------------------- Работа с CSV --------------------
 def load_data():
@@ -212,6 +180,7 @@ def load_data():
         return pd.DataFrame(columns=EXPECTED_COLS)
     try:
         df = pd.read_csv(DATA_PATH, sep=',', encoding='utf-8')
+        # Приводим числовые
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
@@ -219,6 +188,7 @@ def load_data():
             df['player_name'] = df['player_name'].astype(str).replace('nan', '')
         else:
             df['player_name'] = ""
+        # Добавляем недостающие колонки
         for col in EXPECTED_COLS:
             if col not in df.columns:
                 if col == 'score_diff':
@@ -229,14 +199,16 @@ def load_data():
                     continue
                 elif col in numeric_cols:
                     df[col] = 0
-                elif col in ['prev_outcome', 'prev2_outcome', 'prev_my_move', 'prev2_my_move']:
+                elif 'outcome' in col:
+                    df[col] = 'none'
+                else:  # move columns
                     df[col] = '-1'
-                else:
-                    df[col] = ""
         if 'win_category' not in df.columns or df['win_category'].isna().any():
             df['win_category'] = df['opp_match_wins'].apply(compute_win_category)
         df['score_diff'] = df['score_me_before'] - df['score_opp_before']
-        df = df[EXPECTED_COLS]
+        # Приводим порядок колонок (только существующие)
+        existing_cols = [c for c in EXPECTED_COLS if c in df.columns]
+        df = df[existing_cols]
         return df
     except Exception as e:
         st.warning(f"Ошибка загрузки данных: {e}")
@@ -250,7 +222,6 @@ def ensure_csv():
         df.to_csv(DATA_PATH, index=False, sep=',', encoding='utf-8')
 
 def clean_unfinished():
-    """Удаляет незавершённые матчи (у которых нет раунда, завершающего игру)."""
     df = load_data()
     if df.empty:
         return
@@ -280,15 +251,15 @@ def get_last_n_records(n=10):
     if df.empty:
         return df
     df_last = df.tail(n).copy()
-    for col in ['opp_move', 'my_move', 'prev_opp_move', 'prev2_opp_move']:
+    for col in ['opp_move', 'my_move', 'prev_opp_move', 'prev2_opp_move', 'prev3_opp_move', 'prev4_opp_move', 'prev5_opp_move', 'prev6_opp_move']:
         if col in df_last.columns:
             df_last[col] = df_last[col].map(lambda x: LETTER_TO_MOVE.get(x, x))
     if 'outcome' in df_last.columns:
         df_last['outcome'] = df_last['outcome'].map(EN_TO_OUTCOME)
-    if 'prev_outcome' in df_last.columns:
-        df_last['prev_outcome'] = df_last['prev_outcome'].map(lambda x: EN_TO_OUTCOME.get(x, x))
-    if 'prev2_outcome' in df_last.columns:
-        df_last['prev2_outcome'] = df_last['prev2_outcome'].map(lambda x: EN_TO_OUTCOME.get(x, x) if x != 'none' else 'нет')
+    for i in range(1,7):
+        col = f'prev{i}_outcome'
+        if col in df_last.columns:
+            df_last[col] = df_last[col].map(lambda x: EN_TO_OUTCOME.get(x, x) if x != 'none' else 'нет')
     return df_last
 
 # -------------------- Инициализация сессии --------------------
@@ -306,28 +277,36 @@ def init_session():
         st.session_state.selected_opp = None
         st.session_state.selected_outcome = None
         st.session_state.player_name = ""
-        # Загружаем данные и строим статистические таблицы
+        # Загружаем данные и строим вероятностные таблицы для всех раундов 2..7
         df_full = load_data()
         st.session_state.df_full = df_full
-        st.session_state.prob_r2 = prepare_prob_r2(df_full)
-        st.session_state.prob_r3 = prepare_prob_r3(df_full)
-        # Загружаем ML модель
-        st.session_state.ml_model, st.session_state.ml_preprocessor = load_ml_model()
+        st.session_state.prob_r2 = prepare_prob_r(df_full, 2)
+        st.session_state.prob_r3 = prepare_prob_r(df_full, 3)
+        st.session_state.prob_r4 = prepare_prob_r(df_full, 4)
+        st.session_state.prob_r5 = prepare_prob_r(df_full, 5)
+        st.session_state.prob_r6 = prepare_prob_r(df_full, 6)
+        st.session_state.prob_r7 = prepare_prob_r(df_full, 7)
     else:
-        # Обновляем статистические таблицы при каждом запуске
+        # Обновляем таблицы при каждом запуске (если данные изменились)
         df_full = load_data()
         st.session_state.df_full = df_full
-        st.session_state.prob_r2 = prepare_prob_r2(df_full)
-        st.session_state.prob_r3 = prepare_prob_r3(df_full)
+        st.session_state.prob_r2 = prepare_prob_r(df_full, 2)
+        st.session_state.prob_r3 = prepare_prob_r(df_full, 3)
+        st.session_state.prob_r4 = prepare_prob_r(df_full, 4)
+        st.session_state.prob_r5 = prepare_prob_r(df_full, 5)
+        st.session_state.prob_r6 = prepare_prob_r(df_full, 6)
+        st.session_state.prob_r7 = prepare_prob_r(df_full, 7)
 
-# -------------------- Основное приложение --------------------
+# ========================
+# Основное приложение
+# ========================
 st.set_page_config(page_title="Помощник в игре Камень - Ножницы - Бумага", layout="wide")
 st.title("🎮 Помощник в игре 'Камень - Ножницы - Бумага'")
 
 ensure_csv()
-if 'initial_clean_done' not in st.session_state:
+if 'clean_done' not in st.session_state:
     clean_unfinished()
-    st.session_state.initial_clean_done = True
+    st.session_state.clean_done = True
 init_session()
 
 # -------------------- Начало матча --------------------
@@ -344,7 +323,6 @@ if st.session_state.game_state == 'setup':
             winrate = winrate_percent / 100.0
         stake = st.selectbox("Ставка", [25, 50, 100])
         if st.form_submit_button("Начать матч"):
-            clean_unfinished()
             st.session_state.player_name = player_name if player_name else "Неизвестный"
             st.session_state.opp_stats = {'wins': wins, 'winrate': winrate, 'stake': stake}
             st.session_state.match_id = next_match_id()
@@ -357,9 +335,10 @@ if st.session_state.game_state == 'setup':
             st.session_state.selected_opp = None
             st.session_state.selected_outcome = None
             # Предсказание для первого раунда
-            optimal = get_optimal_move_r1(stake, st.session_state.df_full)
-            probable_opp = get_most_probable_opp_r1(stake, st.session_state.df_full)
-            st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[probable_opp])
+            win_cat = compute_win_category(wins)
+            optimal = get_optimal_move_r1(stake, win_cat, st.session_state.df_full)
+            probable = get_most_probable_opp_r1(stake, win_cat, st.session_state.df_full)
+            st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[probable])
             st.rerun()
 
 # -------------------- Игровой процесс --------------------
@@ -371,7 +350,7 @@ elif st.session_state.game_state == 'playing':
         if st.session_state.round_num <= 3:
             st.success(f"🤖 Ваш оптимальный ход на **раунд {st.session_state.round_num}**: **{your_move}**\n\n📊 Наиболее вероятный ход противника: **{probable_opp}**")
         else:
-            st.success(f"🤖 Предсказание на **раунд {st.session_state.round_num}**: противник – **{probable_opp}**, вам – **{your_move}**")
+            st.success(f"🤖 Предсказание на **раунд {st.session_state.round_num}**: рекомендуемый ход – **{your_move}**")
 
     st.subheader("Выберите ход противника и исход раунда")
 
@@ -428,13 +407,19 @@ elif st.session_state.game_state == 'playing':
         else:
             my_letter = opp_letter
 
-        # Данные предыдущих раундов
-        prev_opp = st.session_state.history[-1]['opp_move'] if st.session_state.history else '-1'
-        prev_my = st.session_state.history[-1]['my_move'] if st.session_state.history else '-1'
-        prev_out = st.session_state.history[-1]['outcome'] if st.session_state.history else 'none'
-        prev2_opp = st.session_state.history[-2]['opp_move'] if len(st.session_state.history) >= 2 else '-1'
-        prev2_my = st.session_state.history[-2]['my_move'] if len(st.session_state.history) >= 2 else '-1'
-        prev2_out = st.session_state.history[-2]['outcome'] if len(st.session_state.history) >= 2 else 'none'
+        # Формируем данные предыдущих раундов (до 6 назад)
+        prev_data = {}
+        for i in range(1, 7):
+            idx = -i
+            if len(st.session_state.history) >= i:
+                rec = st.session_state.history[idx]
+                prev_data[f'prev{i}_opp_move'] = rec['opp_move']
+                prev_data[f'prev{i}_my_move'] = rec['my_move']
+                prev_data[f'prev{i}_outcome'] = rec['outcome']
+            else:
+                prev_data[f'prev{i}_opp_move'] = '-1'
+                prev_data[f'prev{i}_my_move'] = '-1'
+                prev_data[f'prev{i}_outcome'] = 'none'
 
         win_cat = compute_win_category(st.session_state.opp_stats['wins'])
         is_last_round = 1 if (st.session_state.score_me == 2 or st.session_state.score_opp == 2) else 0
@@ -454,14 +439,10 @@ elif st.session_state.game_state == 'playing':
             'score_opp_before': st.session_state.score_opp,
             'score_diff': st.session_state.score_me - st.session_state.score_opp,
             'streak_draws': st.session_state.streak_draws,
-            'prev_opp_move': prev_opp,
-            'prev_my_move': prev_my,
-            'prev_outcome': prev_out,
-            'prev2_opp_move': prev2_opp,
-            'prev2_my_move': prev2_my,
-            'prev2_outcome': prev2_out,
-            'is_last_round': is_last_round
+            'is_last_round': is_last_round,
+            **prev_data
         }
+
         st.session_state.history.append(new_row)
 
         # Обновляем счёт
@@ -487,87 +468,132 @@ elif st.session_state.game_state == 'playing':
         if st.session_state.score_me >= 3 or st.session_state.score_opp >= 3:
             st.session_state.game_state = 'finished'
             st.session_state.next_prediction = None
+            clean_unfinished()
             st.success(f"🏆 Матч #{st.session_state.match_id} окончен! Счёт {st.session_state.score_me}:{st.session_state.score_opp}")
             st.rerun()
 
         # --- ПРЕДСКАЗАНИЕ СЛЕДУЮЩЕГО РАУНДА ---
         next_round_num = st.session_state.round_num + 1
+        stake_val = st.session_state.opp_stats['stake']
+        win_cat = compute_win_category(st.session_state.opp_stats['wins'])
+
+        # Функция fallback
+        def fallback_to_r1():
+            return get_optimal_move_r1(stake_val, win_cat, st.session_state.df_full)
+
         if next_round_num == 1:
-            optimal = get_optimal_move_r1(st.session_state.opp_stats['stake'], st.session_state.df_full)
-            probable = get_most_probable_opp_r1(st.session_state.opp_stats['stake'], st.session_state.df_full)
+            optimal = get_optimal_move_r1(stake_val, win_cat, st.session_state.df_full)
+            probable = get_most_probable_opp_r1(stake_val, win_cat, st.session_state.df_full)
             st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[probable])
         elif next_round_num == 2:
             r1 = st.session_state.history[0]
-            optimal = get_optimal_move_r2(st.session_state.opp_stats['stake'],
-                                          r1['outcome'], r1['my_move'], r1['opp_move'],
-                                          st.session_state.prob_r2)
-            probable = get_most_probable_opp_r2(st.session_state.opp_stats['stake'],
-                                                r1['outcome'], r1['my_move'], r1['opp_move'],
-                                                st.session_state.prob_r2)
+            optimal = get_optimal_move_r2(stake_val, win_cat, r1['outcome'], r1['my_move'], r1['opp_move'], st.session_state.prob_r2, st.session_state.df_full)
             if optimal is None:
-                optimal = get_optimal_move_r1(st.session_state.opp_stats['stake'], st.session_state.df_full)
+                optimal = fallback_to_r1()
+            probable = get_most_probable_opp_r2(stake_val, win_cat, r1['outcome'], r1['my_move'], r1['opp_move'], st.session_state.prob_r2)
             if probable is None:
-                probable = get_most_probable_opp_r1(st.session_state.opp_stats['stake'], st.session_state.df_full)
+                probable = get_most_probable_opp_r1(stake_val, win_cat, st.session_state.df_full)
             st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[probable])
         elif next_round_num == 3:
             r1 = st.session_state.history[0]
             r2 = st.session_state.history[1]
-            optimal = get_optimal_move_r3(st.session_state.opp_stats['stake'],
+            optimal = get_optimal_move_r3(stake_val, win_cat, r2['outcome'], r2['my_move'], r2['opp_move'], r1['outcome'], r1['my_move'], r1['opp_move'], st.session_state.prob_r3, st.session_state.df_full)
+            if optimal is None:
+                optimal = get_optimal_move_r2(stake_val, win_cat, r2['outcome'], r2['my_move'], r2['opp_move'], st.session_state.prob_r2, st.session_state.df_full)
+                if optimal is None:
+                    optimal = fallback_to_r1()
+            # Для простоты не показываем probable для раунда 3 (можно добавить, но не обязательно)
+            st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[optimal])
+        elif next_round_num == 4:
+            r1 = st.session_state.history[0]
+            r2 = st.session_state.history[1]
+            r3 = st.session_state.history[2]
+            optimal = get_optimal_move_r4(stake_val, win_cat,
+                                          r3['outcome'], r3['my_move'], r3['opp_move'],
                                           r2['outcome'], r2['my_move'], r2['opp_move'],
                                           r1['outcome'], r1['my_move'], r1['opp_move'],
-                                          st.session_state.prob_r3)
-            probable = get_most_probable_opp_r3(st.session_state.opp_stats['stake'],
-                                                r2['outcome'], r2['my_move'], r2['opp_move'],
-                                                r1['outcome'], r1['my_move'], r1['opp_move'],
-                                                st.session_state.prob_r3)
+                                          st.session_state.prob_r4)
             if optimal is None:
-                optimal = get_optimal_move_r2(st.session_state.opp_stats['stake'],
+                optimal = get_optimal_move_r3(stake_val, win_cat,
+                                              r3['outcome'], r3['my_move'], r3['opp_move'],
                                               r2['outcome'], r2['my_move'], r2['opp_move'],
-                                              st.session_state.prob_r2)
+                                              st.session_state.prob_r3, st.session_state.df_full)
                 if optimal is None:
-                    optimal = get_optimal_move_r1(st.session_state.opp_stats['stake'], st.session_state.df_full)
-            if probable is None:
-                probable = get_most_probable_opp_r2(st.session_state.opp_stats['stake'],
-                                                    r2['outcome'], r2['my_move'], r2['opp_move'],
-                                                    st.session_state.prob_r2)
-                if probable is None:
-                    probable = get_most_probable_opp_r1(st.session_state.opp_stats['stake'], st.session_state.df_full)
-            st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[probable])
-        else:  # >=4
-            curr = st.session_state.history[-1]
-            features = {
-                'round': curr['round'],
-                'stake': curr['stake'],
-                'opp_match_wins': curr['opp_match_wins'],
-                'opp_match_winrate': curr['opp_match_winrate'],
-                'score_me_before': curr['score_me_before'],
-                'score_opp_before': curr['score_opp_before'],
-                'streak_draws': curr['streak_draws'],
-                'is_last_round': 1 if (st.session_state.score_me == 2 or st.session_state.score_opp == 2) else 0,
-                'win_category': curr['win_category'],
-                'opp_move': curr['opp_move'],
-                'my_move': curr['my_move'],
-                'outcome': curr['outcome'],
-                'prev_opp_move': curr['prev_opp_move'],
-                'prev_my_move': curr['prev_my_move'],
-                'prev_outcome': curr['prev_outcome'],
-                'prev2_opp_move': curr['prev2_opp_move'],
-                'prev2_my_move': curr['prev2_my_move'],
-                'prev2_outcome': curr['prev2_outcome']
-            }
-            pred_opp, confidence = predict_opp_ml_with_proba(features, st.session_state.ml_model, st.session_state.ml_preprocessor)
-            if pred_opp is None or confidence < 0.6:
-                # fallback на статистику третьего раунда
-                r1 = st.session_state.history[0]
-                r2 = st.session_state.history[1]
-                pred_opp = get_most_probable_opp_r3(st.session_state.opp_stats['stake'],
-                                                    r2['outcome'], r2['my_move'], r2['opp_move'],
-                                                    r1['outcome'], r1['my_move'], r1['opp_move'],
-                                                    st.session_state.prob_r3)
-                if pred_opp is None:
-                    pred_opp = get_most_probable_opp_r1(st.session_state.opp_stats['stake'], st.session_state.df_full)
-            my_move = counter_move(pred_opp)
-            st.session_state.next_prediction = (LETTER_TO_MOVE[my_move], LETTER_TO_MOVE[pred_opp])
+                    optimal = fallback_to_r1()
+            st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[optimal])
+        elif next_round_num == 5:
+            r1 = st.session_state.history[0]
+            r2 = st.session_state.history[1]
+            r3 = st.session_state.history[2]
+            r4 = st.session_state.history[3]
+            optimal = get_optimal_move_r5(stake_val, win_cat,
+                                          r4['outcome'], r4['my_move'], r4['opp_move'],
+                                          r3['outcome'], r3['my_move'], r3['opp_move'],
+                                          r2['outcome'], r2['my_move'], r2['opp_move'],
+                                          r1['outcome'], r1['my_move'], r1['opp_move'],
+                                          st.session_state.prob_r5)
+            if optimal is None:
+                optimal = get_optimal_move_r4(stake_val, win_cat,
+                                              r4['outcome'], r4['my_move'], r4['opp_move'],
+                                              r3['outcome'], r3['my_move'], r3['opp_move'],
+                                              r2['outcome'], r2['my_move'], r2['opp_move'],
+                                              st.session_state.prob_r4)
+                if optimal is None:
+                    optimal = fallback_to_r1()
+            st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[optimal])
+        elif next_round_num == 6:
+            r1 = st.session_state.history[0]
+            r2 = st.session_state.history[1]
+            r3 = st.session_state.history[2]
+            r4 = st.session_state.history[3]
+            r5 = st.session_state.history[4]
+            optimal = get_optimal_move_r6(stake_val, win_cat,
+                                          r5['outcome'], r5['my_move'], r5['opp_move'],
+                                          r4['outcome'], r4['my_move'], r4['opp_move'],
+                                          r3['outcome'], r3['my_move'], r3['opp_move'],
+                                          r2['outcome'], r2['my_move'], r2['opp_move'],
+                                          r1['outcome'], r1['my_move'], r1['opp_move'],
+                                          st.session_state.prob_r6)
+            if optimal is None:
+                optimal = get_optimal_move_r5(stake_val, win_cat,
+                                              r5['outcome'], r5['my_move'], r5['opp_move'],
+                                              r4['outcome'], r4['my_move'], r4['opp_move'],
+                                              r3['outcome'], r3['my_move'], r3['opp_move'],
+                                              r2['outcome'], r2['my_move'], r2['opp_move'],
+                                              st.session_state.prob_r5)
+                if optimal is None:
+                    optimal = fallback_to_r1()
+            st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[optimal])
+        elif next_round_num == 7:
+            r1 = st.session_state.history[0]
+            r2 = st.session_state.history[1]
+            r3 = st.session_state.history[2]
+            r4 = st.session_state.history[3]
+            r5 = st.session_state.history[4]
+            r6 = st.session_state.history[5]
+            optimal = get_optimal_move_r7(stake_val, win_cat,
+                                          r6['outcome'], r6['my_move'], r6['opp_move'],
+                                          r5['outcome'], r5['my_move'], r5['opp_move'],
+                                          r4['outcome'], r4['my_move'], r4['opp_move'],
+                                          r3['outcome'], r3['my_move'], r3['opp_move'],
+                                          r2['outcome'], r2['my_move'], r2['opp_move'],
+                                          r1['outcome'], r1['my_move'], r1['opp_move'],
+                                          st.session_state.prob_r7)
+            if optimal is None:
+                optimal = get_optimal_move_r6(stake_val, win_cat,
+                                              r6['outcome'], r6['my_move'], r6['opp_move'],
+                                              r5['outcome'], r5['my_move'], r5['opp_move'],
+                                              r4['outcome'], r4['my_move'], r4['opp_move'],
+                                              r3['outcome'], r3['my_move'], r3['opp_move'],
+                                              r2['outcome'], r2['my_move'], r2['opp_move'],
+                                              st.session_state.prob_r6)
+                if optimal is None:
+                    optimal = fallback_to_r1()
+            st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[optimal])
+        else:
+            # Для раундов >7 используем стратегию 7-го раунда (или fallback)
+            optimal = fallback_to_r1()
+            st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[optimal])
 
         st.session_state.round_num = next_round_num
         st.session_state.selected_opp = None
@@ -606,7 +632,6 @@ elif st.session_state.game_state == 'playing':
 elif st.session_state.game_state == 'finished':
     st.info(f"Итоговый счёт матча #{st.session_state.match_id}: {st.session_state.score_me} : {st.session_state.score_opp} | Противник: {st.session_state.player_name}")
     if st.button("➕ Начать новый матч", use_container_width=True):
-        clean_unfinished()
         st.session_state.game_state = 'setup'
         st.session_state.history = []
         st.session_state.score_me = 0
