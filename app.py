@@ -22,13 +22,12 @@ BASE_COLS = [
     'opp_move', 'my_move', 'outcome',
     'score_me_before', 'score_opp_before', 'score_diff', 'streak_draws',
     'prev_opp_move', 'prev_my_move', 'prev_outcome',
-    'prev2_opp_move', 'prev2_my_move', 'prev2_outcome',
-    'is_last_round'
+    'prev2_opp_move', 'prev2_my_move', 'prev2_outcome'
 ]
 EXTRA_COLS = []
 for shift in [3,4,5,6]:
     EXTRA_COLS.extend([f'prev{shift}_opp_move', f'prev{shift}_my_move', f'prev{shift}_outcome'])
-EXPECTED_COLS = BASE_COLS + EXTRA_COLS
+EXPECTED_COLS = BASE_COLS + EXTRA_COLS + ['is_last_round']
 
 # ========================
 # Вспомогательные функции
@@ -45,9 +44,6 @@ def compute_win_category(wins):
     else:
         return '>100'
 
-def counter_move(move):
-    return {'К': 'Б', 'Н': 'К', 'Б': 'Н'}.get(move, 'К')
-
 def get_outcome(my_move, opp_move):
     if my_move == opp_move:
         return 'draw'
@@ -55,26 +51,24 @@ def get_outcome(my_move, opp_move):
         return 'win'
     return 'loss'
 
-# -------------------- Обобщённые функции для вероятностей и выбора хода --------------------
+# -------------------- Вероятностные таблицы с подсчётом --------------------
 def prepare_prob_r(df, round_num):
-    """Строит таблицу вероятностей для заданного раунда, используя только существующие колонки."""
     df_r = df[df['round'] == round_num].copy()
     if df_r.empty:
         return pd.DataFrame()
     group_cols = ['stake', 'win_category']
-    # Добавляем колонки prev1..prev(round_num-1), только если они есть в df_r
     for i in range(1, round_num):
         for suffix in ['_outcome', '_my_move', '_opp_move']:
             col = f'prev{i}{suffix}'
             if col in df_r.columns:
                 group_cols.append(col)
-    # Если нет ни одной prev-колонки (кроме базовых), group_cols может быть ['stake','win_category']
-    return df_r.groupby(group_cols)['opp_move'].value_counts(normalize=True).reset_index(name='prob')
+    counts = df_r.groupby(group_cols)['opp_move'].value_counts().reset_index(name='count')
+    counts['prob'] = counts.groupby(group_cols)['count'].transform(lambda x: x / x.sum())
+    return counts
 
 def get_optimal_move_r(stake, win_category, outcomes, my_moves, opp_moves, prob_r):
-    """Универсальная функция выбора хода на основе вероятностей."""
     if prob_r.empty:
-        return None
+        return None, 0, 0
     mask = (prob_r['stake'] == stake) & (prob_r['win_category'] == win_category)
     for i, (outc, my_m, opp_m) in enumerate(zip(outcomes, my_moves, opp_moves), start=1):
         col_outc = f'prev{i}_outcome'
@@ -88,7 +82,7 @@ def get_optimal_move_r(stake, win_category, outcomes, my_moves, opp_moves, prob_
             mask &= (prob_r[col_opp] == opp_m)
     subset = prob_r[mask]
     if len(subset) == 0:
-        return None
+        return None, 0, 0
     p_k = subset[subset['opp_move'] == 'К']['prob'].sum()
     p_n = subset[subset['opp_move'] == 'Н']['prob'].sum()
     p_b = subset[subset['opp_move'] == 'Б']['prob'].sum()
@@ -96,13 +90,17 @@ def get_optimal_move_r(stake, win_category, outcomes, my_moves, opp_moves, prob_
     exp_n = p_b - p_k
     exp_b = p_k - p_n
     if exp_k >= exp_n and exp_k >= exp_b:
-        return 'К'
+        best_move = 'К'
     elif exp_n >= exp_b:
-        return 'Н'
+        best_move = 'Н'
     else:
-        return 'Б'
+        best_move = 'Б'
+    best_row = subset.loc[subset['prob'].idxmax()]
+    confidence = best_row['prob']
+    support = subset['count'].sum()
+    return best_move, confidence, support
 
-# Обёртки для каждого раунда (для удобства вызова)
+# -------------------- Обёртки для раундов 1-7 --------------------
 def get_optimal_move_r1(stake, win_category, df):
     sub = df[(df["round"] == 1) & (df["stake"] == stake) & (df["win_category"] == win_category)]
     if len(sub) == 0:
@@ -110,7 +108,7 @@ def get_optimal_move_r1(stake, win_category, df):
         if len(sub) == 0:
             sub = df[(df["round"] == 1) & (df["stake"] == stake)]
             if len(sub) == 0:
-                return 'К'
+                return 'К', 0, 0
     counts = sub["opp_move"].value_counts()
     total = len(sub)
     p_k = counts.get('К', 0) / total
@@ -120,40 +118,17 @@ def get_optimal_move_r1(stake, win_category, df):
     exp_n = p_b - p_k
     exp_b = p_k - p_n
     if exp_k >= exp_n and exp_k >= exp_b:
-        return 'К'
+        best = 'К'
     elif exp_n >= exp_b:
-        return 'Н'
+        best = 'Н'
     else:
-        return 'Б'
-
-def get_most_probable_opp_r1(stake, win_category, df):
-    sub = df[(df["round"] == 1) & (df["stake"] == stake) & (df["win_category"] == win_category)]
-    if len(sub) == 0:
-        sub = df[(df["round"] == 1) & (df["win_category"] == win_category)]
-        if len(sub) == 0:
-            sub = df[(df["round"] == 1) & (df["stake"] == stake)]
-            if len(sub) == 0:
-                return 'К'
-    return sub['opp_move'].mode()[0] if not sub.empty else 'К'
+        best = 'Б'
+    best_count = counts.get(best, 0)
+    confidence = best_count / total if total > 0 else 0
+    return best, confidence, total
 
 def get_optimal_move_r2(stake, win_category, outc1, my1, opp1, prob_r2, _):
     return get_optimal_move_r(stake, win_category, [outc1], [my1], [opp1], prob_r2)
-
-def get_most_probable_opp_r2(stake, win_category, outc1, my1, opp1, prob_r2):
-    if prob_r2.empty:
-        return None
-    mask = (prob_r2['stake'] == stake) & (prob_r2['win_category'] == win_category)
-    if 'prev_outcome' in prob_r2.columns:
-        mask &= (prob_r2['prev_outcome'] == outc1)
-    if 'prev_my_move' in prob_r2.columns:
-        mask &= (prob_r2['prev_my_move'] == my1)
-    if 'prev_opp_move' in prob_r2.columns:
-        mask &= (prob_r2['prev_opp_move'] == opp1)
-    subset = prob_r2[mask]
-    if len(subset) == 0:
-        return None
-    grouped = subset.groupby('opp_move')['prob'].sum()
-    return grouped.idxmax() if not grouped.empty else None
 
 def get_optimal_move_r3(stake, win_category, outc2, my2, opp2, outc1, my1, opp1, prob_r3, _):
     return get_optimal_move_r(stake, win_category, [outc2, outc1], [my2, my1], [opp2, opp1], prob_r3)
@@ -172,12 +147,13 @@ def get_optimal_move_r7(stake, win_category, outc6, my6, opp6, outc5, my5, opp5,
 
 # -------------------- Работа с CSV --------------------
 def load_data():
-    numeric_cols = ['round', 'opp_match_wins', 'opp_match_winrate', 'stake',
-                    'score_me_before', 'score_opp_before', 'streak_draws', 'is_last_round']
+    numeric_cols = ['match_id', 'round', 'opp_match_wins', 'opp_match_winrate', 'stake',
+                    'score_me_before', 'score_opp_before', 'score_diff', 'streak_draws', 'is_last_round']
     if not os.path.exists(DATA_PATH):
         return pd.DataFrame(columns=EXPECTED_COLS)
     try:
         df = pd.read_csv(DATA_PATH, sep=',', encoding='utf-8')
+        # Приведение типов
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
@@ -185,7 +161,7 @@ def load_data():
             df['player_name'] = df['player_name'].astype(str).replace('nan', '')
         else:
             df['player_name'] = ""
-        # Добавляем недостающие колонки
+        # Добавление недостающих колонок
         for col in EXPECTED_COLS:
             if col not in df.columns:
                 if col == 'score_diff':
@@ -203,7 +179,7 @@ def load_data():
         if 'win_category' not in df.columns or df['win_category'].isna().any():
             df['win_category'] = df['opp_match_wins'].apply(compute_win_category)
         df['score_diff'] = df['score_me_before'] - df['score_opp_before']
-        # Оставляем только существующие колонки из EXPECTED_COLS
+        # Оставляем только нужные колонки в правильном порядке
         existing_cols = [c for c in EXPECTED_COLS if c in df.columns]
         df = df[existing_cols]
         return df
@@ -248,9 +224,9 @@ def get_last_n_records(n=10):
     if df.empty:
         return df
     df_last = df.tail(n).copy()
-    # Преобразуем буквенные ходы в названия для отображения
+    # Преобразование для отображения
     for col in df_last.columns:
-        if col.endswith('_move') and col != 'my_move' and col != 'opp_move':
+        if col.endswith('_move') and col not in ['my_move', 'opp_move']:
             df_last[col] = df_last[col].map(lambda x: LETTER_TO_MOVE.get(x, x))
     if 'opp_move' in df_last.columns:
         df_last['opp_move'] = df_last['opp_move'].map(lambda x: LETTER_TO_MOVE.get(x, x))
@@ -279,7 +255,6 @@ def init_session():
         st.session_state.selected_opp = None
         st.session_state.selected_outcome = None
         st.session_state.player_name = ""
-        # Загружаем данные и строим вероятностные таблицы
         df_full = load_data()
         st.session_state.df_full = df_full
         st.session_state.prob_r2 = prepare_prob_r(df_full, 2)
@@ -289,7 +264,6 @@ def init_session():
         st.session_state.prob_r6 = prepare_prob_r(df_full, 6)
         st.session_state.prob_r7 = prepare_prob_r(df_full, 7)
     else:
-        # Обновляем таблицы при каждом запуске (если данные изменились)
         df_full = load_data()
         st.session_state.df_full = df_full
         st.session_state.prob_r2 = prepare_prob_r(df_full, 2)
@@ -337,9 +311,8 @@ if st.session_state.game_state == 'setup':
             st.session_state.selected_opp = None
             st.session_state.selected_outcome = None
             win_cat = compute_win_category(wins)
-            optimal = get_optimal_move_r1(stake, win_cat, st.session_state.df_full)
-            probable = get_most_probable_opp_r1(stake, win_cat, st.session_state.df_full)
-            st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[probable])
+            optimal, conf, sup = get_optimal_move_r1(stake, win_cat, st.session_state.df_full)
+            st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[optimal], conf, sup)
             st.rerun()
 
 # -------------------- Игровой процесс --------------------
@@ -347,11 +320,16 @@ elif st.session_state.game_state == 'playing':
     st.info(f"Счёт: **{st.session_state.score_me} : {st.session_state.score_opp}** | Раунд {st.session_state.round_num} | Матч #{st.session_state.match_id} | Противник: {st.session_state.player_name}")
 
     if st.session_state.next_prediction:
-        your_move, probable_opp = st.session_state.next_prediction
+        your_move, probable_opp, confidence, support = st.session_state.next_prediction
         if st.session_state.round_num <= 3:
-            st.success(f"🤖 Ваш оптимальный ход на **раунд {st.session_state.round_num}**: **{your_move}**\n\n📊 Наиболее вероятный ход противника: **{probable_opp}**")
+            msg = f"🤖 Ваш оптимальный ход на **раунд {st.session_state.round_num}**: **{your_move}**\n\n📊 Наиболее вероятный ход противника: **{probable_opp}**"
         else:
-            st.success(f"🤖 Предсказание на **раунд {st.session_state.round_num}**: рекомендуемый ход – **{your_move}**")
+            msg = f"🤖 Предсказание на **раунд {st.session_state.round_num}**: рекомендуемый ход – **{your_move}**"
+        if support > 0:
+            msg += f"\n\n📈 Основано на **{support}** примерах (уверенность {confidence:.1%})"
+        else:
+            msg += "\n\n⚠️ Недостаточно данных для статистики, рекомендован базовый ход."
+        st.success(msg)
 
     st.subheader("Выберите ход противника и исход раунда")
 
@@ -439,8 +417,8 @@ elif st.session_state.game_state == 'playing':
             'score_opp_before': st.session_state.score_opp,
             'score_diff': st.session_state.score_me - st.session_state.score_opp,
             'streak_draws': st.session_state.streak_draws,
-            'is_last_round': is_last_round,
-            **prev_data
+            **prev_data,
+            'is_last_round': is_last_round
         }
 
         st.session_state.history.append(new_row)
@@ -478,105 +456,101 @@ elif st.session_state.game_state == 'playing':
         win_cat = compute_win_category(st.session_state.opp_stats['wins'])
 
         def fallback_to_r1():
-            return get_optimal_move_r1(stake_val, win_cat, st.session_state.df_full)
+            opt, conf, sup = get_optimal_move_r1(stake_val, win_cat, st.session_state.df_full)
+            return opt, conf, sup
 
         if next_round_num == 1:
-            optimal = get_optimal_move_r1(stake_val, win_cat, st.session_state.df_full)
-            probable = get_most_probable_opp_r1(stake_val, win_cat, st.session_state.df_full)
-            st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[probable])
+            opt, conf, sup = fallback_to_r1()
+            st.session_state.next_prediction = (LETTER_TO_MOVE[opt], LETTER_TO_MOVE[opt], conf, sup)
         elif next_round_num == 2:
             r1 = st.session_state.history[0]
-            optimal = get_optimal_move_r2(stake_val, win_cat, r1['outcome'], r1['my_move'], r1['opp_move'], st.session_state.prob_r2, None)
-            if optimal is None:
-                optimal = fallback_to_r1()
-            probable = get_most_probable_opp_r2(stake_val, win_cat, r1['outcome'], r1['my_move'], r1['opp_move'], st.session_state.prob_r2)
-            if probable is None:
-                probable = get_most_probable_opp_r1(stake_val, win_cat, st.session_state.df_full)
-            st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[probable])
+            opt, conf, sup = get_optimal_move_r2(stake_val, win_cat, r1['outcome'], r1['my_move'], r1['opp_move'], st.session_state.prob_r2, None)
+            if opt is None:
+                opt, conf, sup = fallback_to_r1()
+            st.session_state.next_prediction = (LETTER_TO_MOVE[opt], LETTER_TO_MOVE[opt], conf, sup)
         elif next_round_num == 3:
-            r1 = st.session_state.history[0]
-            r2 = st.session_state.history[1]
-            optimal = get_optimal_move_r3(stake_val, win_cat, r2['outcome'], r2['my_move'], r2['opp_move'], r1['outcome'], r1['my_move'], r1['opp_move'], st.session_state.prob_r3, None)
-            if optimal is None:
-                optimal = get_optimal_move_r2(stake_val, win_cat, r2['outcome'], r2['my_move'], r2['opp_move'], st.session_state.prob_r2, None)
-                if optimal is None:
-                    optimal = fallback_to_r1()
-            st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[optimal])
+            r1, r2 = st.session_state.history[0], st.session_state.history[1]
+            opt, conf, sup = get_optimal_move_r3(stake_val, win_cat, r2['outcome'], r2['my_move'], r2['opp_move'], r1['outcome'], r1['my_move'], r1['opp_move'], st.session_state.prob_r3, None)
+            if opt is None:
+                opt, conf, sup = get_optimal_move_r2(stake_val, win_cat, r2['outcome'], r2['my_move'], r2['opp_move'], st.session_state.prob_r2, None)
+                if opt is None:
+                    opt, conf, sup = fallback_to_r1()
+            st.session_state.next_prediction = (LETTER_TO_MOVE[opt], LETTER_TO_MOVE[opt], conf, sup)
         elif next_round_num == 4:
             r1, r2, r3 = st.session_state.history[0], st.session_state.history[1], st.session_state.history[2]
-            optimal = get_optimal_move_r4(stake_val, win_cat,
-                                          r3['outcome'], r3['my_move'], r3['opp_move'],
-                                          r2['outcome'], r2['my_move'], r2['opp_move'],
-                                          r1['outcome'], r1['my_move'], r1['opp_move'],
-                                          st.session_state.prob_r4)
-            if optimal is None:
-                optimal = get_optimal_move_r3(stake_val, win_cat,
-                                              r3['outcome'], r3['my_move'], r3['opp_move'],
-                                              r2['outcome'], r2['my_move'], r2['opp_move'],
-                                              st.session_state.prob_r3, None)
-                if optimal is None:
-                    optimal = fallback_to_r1()
-            st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[optimal])
+            opt, conf, sup = get_optimal_move_r4(stake_val, win_cat,
+                                                 r3['outcome'], r3['my_move'], r3['opp_move'],
+                                                 r2['outcome'], r2['my_move'], r2['opp_move'],
+                                                 r1['outcome'], r1['my_move'], r1['opp_move'],
+                                                 st.session_state.prob_r4)
+            if opt is None:
+                opt, conf, sup = get_optimal_move_r3(stake_val, win_cat,
+                                                     r3['outcome'], r3['my_move'], r3['opp_move'],
+                                                     r2['outcome'], r2['my_move'], r2['opp_move'],
+                                                     st.session_state.prob_r3, None)
+                if opt is None:
+                    opt, conf, sup = fallback_to_r1()
+            st.session_state.next_prediction = (LETTER_TO_MOVE[opt], LETTER_TO_MOVE[opt], conf, sup)
         elif next_round_num == 5:
             r1, r2, r3, r4 = st.session_state.history[0], st.session_state.history[1], st.session_state.history[2], st.session_state.history[3]
-            optimal = get_optimal_move_r5(stake_val, win_cat,
-                                          r4['outcome'], r4['my_move'], r4['opp_move'],
-                                          r3['outcome'], r3['my_move'], r3['opp_move'],
-                                          r2['outcome'], r2['my_move'], r2['opp_move'],
-                                          r1['outcome'], r1['my_move'], r1['opp_move'],
-                                          st.session_state.prob_r5)
-            if optimal is None:
-                optimal = get_optimal_move_r4(stake_val, win_cat,
-                                              r4['outcome'], r4['my_move'], r4['opp_move'],
-                                              r3['outcome'], r3['my_move'], r3['opp_move'],
-                                              r2['outcome'], r2['my_move'], r2['opp_move'],
-                                              st.session_state.prob_r4)
-                if optimal is None:
-                    optimal = fallback_to_r1()
-            st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[optimal])
+            opt, conf, sup = get_optimal_move_r5(stake_val, win_cat,
+                                                 r4['outcome'], r4['my_move'], r4['opp_move'],
+                                                 r3['outcome'], r3['my_move'], r3['opp_move'],
+                                                 r2['outcome'], r2['my_move'], r2['opp_move'],
+                                                 r1['outcome'], r1['my_move'], r1['opp_move'],
+                                                 st.session_state.prob_r5)
+            if opt is None:
+                opt, conf, sup = get_optimal_move_r4(stake_val, win_cat,
+                                                     r4['outcome'], r4['my_move'], r4['opp_move'],
+                                                     r3['outcome'], r3['my_move'], r3['opp_move'],
+                                                     r2['outcome'], r2['my_move'], r2['opp_move'],
+                                                     st.session_state.prob_r4)
+                if opt is None:
+                    opt, conf, sup = fallback_to_r1()
+            st.session_state.next_prediction = (LETTER_TO_MOVE[opt], LETTER_TO_MOVE[opt], conf, sup)
         elif next_round_num == 6:
             r1, r2, r3, r4, r5 = st.session_state.history[0], st.session_state.history[1], st.session_state.history[2], st.session_state.history[3], st.session_state.history[4]
-            optimal = get_optimal_move_r6(stake_val, win_cat,
-                                          r5['outcome'], r5['my_move'], r5['opp_move'],
-                                          r4['outcome'], r4['my_move'], r4['opp_move'],
-                                          r3['outcome'], r3['my_move'], r3['opp_move'],
-                                          r2['outcome'], r2['my_move'], r2['opp_move'],
-                                          r1['outcome'], r1['my_move'], r1['opp_move'],
-                                          st.session_state.prob_r6)
-            if optimal is None:
-                optimal = get_optimal_move_r5(stake_val, win_cat,
-                                              r5['outcome'], r5['my_move'], r5['opp_move'],
-                                              r4['outcome'], r4['my_move'], r4['opp_move'],
-                                              r3['outcome'], r3['my_move'], r3['opp_move'],
-                                              r2['outcome'], r2['my_move'], r2['opp_move'],
-                                              st.session_state.prob_r5)
-                if optimal is None:
-                    optimal = fallback_to_r1()
-            st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[optimal])
+            opt, conf, sup = get_optimal_move_r6(stake_val, win_cat,
+                                                 r5['outcome'], r5['my_move'], r5['opp_move'],
+                                                 r4['outcome'], r4['my_move'], r4['opp_move'],
+                                                 r3['outcome'], r3['my_move'], r3['opp_move'],
+                                                 r2['outcome'], r2['my_move'], r2['opp_move'],
+                                                 r1['outcome'], r1['my_move'], r1['opp_move'],
+                                                 st.session_state.prob_r6)
+            if opt is None:
+                opt, conf, sup = get_optimal_move_r5(stake_val, win_cat,
+                                                     r5['outcome'], r5['my_move'], r5['opp_move'],
+                                                     r4['outcome'], r4['my_move'], r4['opp_move'],
+                                                     r3['outcome'], r3['my_move'], r3['opp_move'],
+                                                     r2['outcome'], r2['my_move'], r2['opp_move'],
+                                                     st.session_state.prob_r5)
+                if opt is None:
+                    opt, conf, sup = fallback_to_r1()
+            st.session_state.next_prediction = (LETTER_TO_MOVE[opt], LETTER_TO_MOVE[opt], conf, sup)
         elif next_round_num == 7:
             r1, r2, r3, r4, r5, r6 = st.session_state.history[0], st.session_state.history[1], st.session_state.history[2], st.session_state.history[3], st.session_state.history[4], st.session_state.history[5]
-            optimal = get_optimal_move_r7(stake_val, win_cat,
-                                          r6['outcome'], r6['my_move'], r6['opp_move'],
-                                          r5['outcome'], r5['my_move'], r5['opp_move'],
-                                          r4['outcome'], r4['my_move'], r4['opp_move'],
-                                          r3['outcome'], r3['my_move'], r3['opp_move'],
-                                          r2['outcome'], r2['my_move'], r2['opp_move'],
-                                          r1['outcome'], r1['my_move'], r1['opp_move'],
-                                          st.session_state.prob_r7)
-            if optimal is None:
-                optimal = get_optimal_move_r6(stake_val, win_cat,
-                                              r6['outcome'], r6['my_move'], r6['opp_move'],
-                                              r5['outcome'], r5['my_move'], r5['opp_move'],
-                                              r4['outcome'], r4['my_move'], r4['opp_move'],
-                                              r3['outcome'], r3['my_move'], r3['opp_move'],
-                                              r2['outcome'], r2['my_move'], r2['opp_move'],
-                                              st.session_state.prob_r6)
-                if optimal is None:
-                    optimal = fallback_to_r1()
-            st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[optimal])
+            opt, conf, sup = get_optimal_move_r7(stake_val, win_cat,
+                                                 r6['outcome'], r6['my_move'], r6['opp_move'],
+                                                 r5['outcome'], r5['my_move'], r5['opp_move'],
+                                                 r4['outcome'], r4['my_move'], r4['opp_move'],
+                                                 r3['outcome'], r3['my_move'], r3['opp_move'],
+                                                 r2['outcome'], r2['my_move'], r2['opp_move'],
+                                                 r1['outcome'], r1['my_move'], r1['opp_move'],
+                                                 st.session_state.prob_r7)
+            if opt is None:
+                opt, conf, sup = get_optimal_move_r6(stake_val, win_cat,
+                                                     r6['outcome'], r6['my_move'], r6['opp_move'],
+                                                     r5['outcome'], r5['my_move'], r5['opp_move'],
+                                                     r4['outcome'], r4['my_move'], r4['opp_move'],
+                                                     r3['outcome'], r3['my_move'], r3['opp_move'],
+                                                     r2['outcome'], r2['my_move'], r2['opp_move'],
+                                                     st.session_state.prob_r6)
+                if opt is None:
+                    opt, conf, sup = fallback_to_r1()
+            st.session_state.next_prediction = (LETTER_TO_MOVE[opt], LETTER_TO_MOVE[opt], conf, sup)
         else:
-            optimal = fallback_to_r1()
-            st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[optimal])
+            opt, conf, sup = fallback_to_r1()
+            st.session_state.next_prediction = (LETTER_TO_MOVE[opt], LETTER_TO_MOVE[opt], conf, sup)
 
         st.session_state.round_num = next_round_num
         st.session_state.selected_opp = None
