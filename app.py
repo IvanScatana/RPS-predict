@@ -157,7 +157,7 @@ def get_optimal_move_r_cascade(stake, win_category, outcomes, my_moves, opp_move
             continue
         subset = prob_r[mask]
         if len(subset) > 0:
-            # Вычисляем ожидаемый выигрыш для своего хода (через prob, как работало)
+            # Вычисляем ожидаемый выигрыш для своего хода (через prob)
             p_k = subset[subset['opp_move'] == 'К']['prob'].sum()
             p_n = subset[subset['opp_move'] == 'Н']['prob'].sum()
             p_b = subset[subset['opp_move'] == 'Б']['prob'].sum()
@@ -170,10 +170,28 @@ def get_optimal_move_r_cascade(stake, win_category, outcomes, my_moves, opp_move
                 best_move = 'Н'
             else:
                 best_move = 'Б'
-            # Уверенность и поддержка через count (чтобы не было >100%)
+            
             total_count = subset['count'].sum()
-            win_count = subset[subset['opp_move'] == best_move]['count'].sum()
-            confidence = win_count / total_count if total_count > 0 else 0
+            # Проверяем, все ли примеры с одним ходом соперника
+            unique_opp_moves = subset['opp_move'].unique()
+            if len(unique_opp_moves) == 1:
+                only_opp_move = unique_opp_moves[0]
+                # Если наш ход выигрывает у этого единственного хода, уверенность 100%
+                if (best_move == 'К' and only_opp_move == 'Н') or \
+                   (best_move == 'Н' and only_opp_move == 'Б') or \
+                   (best_move == 'Б' and only_opp_move == 'К'):
+                    confidence = 1.0
+                else:
+                    confidence = 0.0  # проигрыш или ничья – не победа
+            else:
+                # Вычисляем долю побед
+                win_count = 0
+                for opp, cnt in zip(subset['opp_move'], subset['count']):
+                    if (best_move == 'К' and opp == 'Н') or \
+                       (best_move == 'Н' and opp == 'Б') or \
+                       (best_move == 'Б' and opp == 'К'):
+                        win_count += cnt
+                confidence = win_count / total_count if total_count > 0 else 0
             support = total_count
             return best_move, confidence, support
     opt, conf, sup = get_optimal_move_r1(stake, win_category, df_full)
