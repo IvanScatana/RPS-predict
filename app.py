@@ -15,7 +15,7 @@ OUTCOME_TO_EN = {"Победа": "win", "Поражение": "lose", "Ничь�
 EN_TO_OUTCOME = {v: k for k, v in OUTCOME_TO_EN.items()}
 MOVE_EMOJI = {"Камень": "✊", "Ножницы": "✌️", "Бумага": "✋"}
 
-# Базовые колонки (без prev и без is_last_round)
+# Базовые колонки (без prev)
 BASE_COLS = [
     'match_id', 'round', 'player_name', 'win_category',
     'opp_match_wins', 'opp_match_winrate', 'stake',
@@ -65,9 +65,6 @@ def load_data_cached():
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-        # Приводим is_last_round к int (если он float)
-        if 'is_last_round' in df.columns:
-            df['is_last_round'] = df['is_last_round'].astype(int)
         if 'player_name' in df.columns:
             df['player_name'] = df['player_name'].astype(str).replace('nan', '')
         else:
@@ -153,12 +150,8 @@ def get_most_probable_opp_r1(stake, win_category, df):
 
 # -------------------- Обобщённая функция для раундов 2..7 (точное совпадение) --------------------
 def get_move_for_round(round_num, stake, win_category, history, prob_table, df_full):
-    """
-    Возвращает (optimal_move, confidence, support, most_probable_opp)
-    """
     if prob_table.empty:
         return None, 0, 0, None
-    # Строим маску по всем предыдущим раундам
     mask = (prob_table['stake'] == stake) & (prob_table['win_category'] == win_category)
     for i in range(1, round_num):
         col_outc = f'prev{i}_outcome'
@@ -166,7 +159,6 @@ def get_move_for_round(round_num, stake, win_category, history, prob_table, df_f
         col_opp = f'prev{i}_opp_move'
         if col_outc not in prob_table.columns:
             return None, 0, 0, None
-        # Данные из истории: history[-i] - i-й с конца (последний - это предыдущий раунд)
         rec = history[-i]
         mask &= (prob_table[col_outc] == rec['outcome'])
         mask &= (prob_table[col_my] == rec['my_move'])
@@ -188,7 +180,6 @@ def get_move_for_round(round_num, stake, win_category, history, prob_table, df_f
     best_move = max(not_lose, key=not_lose.get)
     confidence = not_lose[best_move]
     support = total
-    # Наиболее вероятный ход противника (мода)
     opp_counts = subset.groupby('opp_move')['count'].sum()
     most_probable_opp = opp_counts.idxmax() if not opp_counts.empty else 'К'
     return best_move, confidence, support, most_probable_opp
@@ -329,6 +320,11 @@ if st.session_state.game_state == 'setup':
             win_cat = compute_win_category(wins)
             optimal, conf, sup = get_optimal_move_r1(stake, win_cat, st.session_state.df_full)
             probable_opp = get_most_probable_opp_r1(stake, win_cat, st.session_state.df_full)
+            # Проверка корректности
+            if optimal not in LETTER_TO_MOVE:
+                optimal = 'К'
+            if probable_opp not in LETTER_TO_MOVE:
+                probable_opp = 'К'
             st.session_state.next_prediction = (LETTER_TO_MOVE[optimal], LETTER_TO_MOVE[probable_opp], conf, sup)
             st.rerun()
 
@@ -419,7 +415,6 @@ elif st.session_state.game_state == 'playing':
         win_cat = compute_win_category(st.session_state.opp_stats['wins'])
         is_last_round = 1 if (st.session_state.score_me == 2 or st.session_state.score_opp == 2) else 0
 
-        # Собираем new_row в порядке EXPECTED_COLS
         new_row = {
             'match_id': st.session_state.match_id,
             'round': st.session_state.round_num,
@@ -519,6 +514,11 @@ elif st.session_state.game_state == 'playing':
         else:
             opt, conf, sup, prob_opp = base_prediction()
 
+        # Проверка корректности перед использованием словаря
+        if opt not in LETTER_TO_MOVE:
+            opt = 'К'
+        if prob_opp not in LETTER_TO_MOVE:
+            prob_opp = 'К'
         st.session_state.next_prediction = (LETTER_TO_MOVE[opt], LETTER_TO_MOVE[prob_opp], conf, sup)
         st.session_state.round_num = next_round_num
         st.session_state.selected_opp = None
