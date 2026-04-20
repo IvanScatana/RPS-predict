@@ -172,26 +172,16 @@ def get_optimal_move_r_cascade(stake, win_category, outcomes, my_moves, opp_move
                 best_move = 'Б'
             
             total_count = subset['count'].sum()
-            # Проверяем, все ли примеры с одним ходом соперника
-            unique_opp_moves = subset['opp_move'].unique()
-            if len(unique_opp_moves) == 1:
-                only_opp_move = unique_opp_moves[0]
-                # Если наш ход выигрывает у этого единственного хода, уверенность 100%
-                if (best_move == 'К' and only_opp_move == 'Н') or \
-                   (best_move == 'Н' and only_opp_move == 'Б') or \
-                   (best_move == 'Б' and only_opp_move == 'К'):
-                    confidence = 1.0
-                else:
-                    confidence = 0.0  # проигрыш или ничья – не победа
-            else:
-                # Вычисляем долю побед
-                win_count = 0
-                for opp, cnt in zip(subset['opp_move'], subset['count']):
-                    if (best_move == 'К' and opp == 'Н') or \
-                       (best_move == 'Н' and opp == 'Б') or \
-                       (best_move == 'Б' and opp == 'К'):
-                        win_count += cnt
-                confidence = win_count / total_count if total_count > 0 else 0
+            # Подсчитываем количество исходов, где мы не проигрываем (победа или ничья)
+            not_lose_count = 0
+            for opp, cnt in zip(subset['opp_move'], subset['count']):
+                if best_move == opp:
+                    not_lose_count += cnt  # ничья
+                elif (best_move == 'К' and opp == 'Н') or \
+                     (best_move == 'Н' and opp == 'Б') or \
+                     (best_move == 'Б' and opp == 'К'):
+                    not_lose_count += cnt  # победа
+            confidence = not_lose_count / total_count if total_count > 0 else 0
             support = total_count
             return best_move, confidence, support
     opt, conf, sup = get_optimal_move_r1(stake, win_category, df_full)
