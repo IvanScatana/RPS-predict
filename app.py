@@ -15,77 +15,25 @@ OUTCOME_TO_EN = {"Победа": "win", "Поражение": "lose", "Ничь�
 EN_TO_OUTCOME = {v: k for k, v in OUTCOME_TO_EN.items()}
 MOVE_EMOJI = {"Камень": "✊", "Ножницы": "✌️", "Бумага": "✋"}
 
-# Базовые колонки + динамические prev3..prev6
+# Базовые колонки (без prev)
 BASE_COLS = [
     'match_id', 'round', 'player_name', 'win_category',
     'opp_match_wins', 'opp_match_winrate', 'stake',
     'opp_move', 'my_move', 'outcome',
     'score_me_before', 'score_opp_before', 'score_diff', 'streak_draws',
-    'prev_opp_move', 'prev_my_move', 'prev_outcome',
-    'prev2_opp_move', 'prev2_my_move', 'prev2_outcome'
+    'is_last_round'
 ]
-EXTRA_COLS = []
-for shift in [3,4,5,6]:
-    EXTRA_COLS.extend([f'prev{shift}_opp_move', f'prev{shift}_my_move', f'prev{shift}_outcome'])
-EXPECTED_COLS = BASE_COLS + EXTRA_COLS + ['is_last_round']
+
+# Генерируем все prev-колонки для сдвигов 1..6
+PREV_COLS = []
+for shift in range(1, 7):
+    PREV_COLS.extend([f'prev{shift}_opp_move', f'prev{shift}_my_move', f'prev{shift}_outcome'])
+
+EXPECTED_COLS = BASE_COLS + PREV_COLS
 
 # ========================
-# Кешированные функции загрузки и подготовки
+# Вспомогательные функции
 # ========================
-@st.cache_data(ttl=3600)
-def load_data_cached():
-    numeric_cols = ['match_id', 'round', 'opp_match_wins', 'opp_match_winrate', 'stake',
-                    'score_me_before', 'score_opp_before', 'score_diff', 'streak_draws', 'is_last_round']
-    if not os.path.exists(DATA_PATH):
-        return pd.DataFrame(columns=EXPECTED_COLS)
-    try:
-        df = pd.read_csv(DATA_PATH, sep=',', encoding='utf-8')
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-        if 'player_name' in df.columns:
-            df['player_name'] = df['player_name'].astype(str).replace('nan', '')
-        else:
-            df['player_name'] = ""
-        for col in EXPECTED_COLS:
-            if col not in df.columns:
-                if col == 'score_diff':
-                    df[col] = 0
-                elif col == 'player_name':
-                    df[col] = ""
-                elif col == 'win_category':
-                    continue
-                elif col in numeric_cols:
-                    df[col] = 0
-                elif 'outcome' in col:
-                    df[col] = 'none'
-                else:
-                    df[col] = '-1'
-        if 'win_category' not in df.columns or df['win_category'].isna().any():
-            df['win_category'] = df['opp_match_wins'].apply(compute_win_category)
-        df['score_diff'] = df['score_me_before'] - df['score_opp_before']
-        existing_cols = [c for c in EXPECTED_COLS if c in df.columns]
-        df = df[existing_cols]
-        return df
-    except Exception as e:
-        st.warning(f"Ошибка загрузки данных: {e}")
-        return pd.DataFrame(columns=EXPECTED_COLS)
-
-@st.cache_data(ttl=3600)
-def prepare_prob_r_cached(df, round_num):
-    df_r = df[df['round'] == round_num].copy()
-    if df_r.empty:
-        return pd.DataFrame()
-    group_cols = ['stake', 'win_category']
-    for i in range(1, round_num):
-        for suffix in ['_outcome', '_my_move', '_opp_move']:
-            col = f'prev{i}{suffix}'
-            if col in df_r.columns:
-                group_cols.append(col)
-    counts = df_r.groupby(group_cols)['opp_move'].value_counts().reset_index(name='count')
-    counts['prob'] = counts.groupby(group_cols)['count'].transform(lambda x: x / x.sum())
-    return counts
-
 def compute_win_category(wins):
     if wins == -1:
         return 'unknown'
@@ -104,6 +52,62 @@ def get_outcome(my_move, opp_move):
     if (my_move == 'К' and opp_move == 'Н') or (my_move == 'Н' and opp_move == 'Б') or (my_move == 'Б' and opp_move == 'К'):
         return 'win'
     return 'loss'
+
+# -------------------- Загрузка и подготовка данных (с кешем) --------------------
+@st.cache_data(ttl=3600)
+def load_data_cached():
+    numeric_cols = ['match_id', 'round', 'opp_match_wins', 'opp_match_winrate', 'stake',
+                    'score_me_before', 'score_opp_before', 'score_diff', 'streak_draws', 'is_last_round']
+    if not os.path.exists(DATA_PATH):
+        return pd.DataFrame(columns=EXPECTED_COLS)
+    try:
+        df = pd.read_csv(DATA_PATH, sep=',', encoding='utf-8')
+        # Приведение типов
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        if 'player_name' in df.columns:
+            df['player_name'] = df['player_name'].astype(str).replace('nan', '')
+        else:
+            df['player_name'] = ""
+        # Добавление недостающих колонок
+        for col in EXPECTED_COLS:
+            if col not in df.columns:
+                if col == 'score_diff':
+                    df[col] = 0
+                elif col == 'player_name':
+                    df[col] = ""
+                elif col == 'win_category':
+                    continue
+                elif col in numeric_cols:
+                    df[col] = 0
+                elif 'outcome' in col:
+                    df[col] = 'none'
+                else:
+                    df[col] = '-1'
+        if 'win_category' not in df.columns or df['win_category'].isna().any():
+            df['win_category'] = df['opp_match_wins'].apply(compute_win_category)
+        df['score_diff'] = df['score_me_before'] - df['score_opp_before']
+        # Оставляем только нужные колонки
+        df = df[[c for c in EXPECTED_COLS if c in df.columns]]
+        return df
+    except Exception as e:
+        st.warning(f"Ошибка загрузки данных: {e}")
+        return pd.DataFrame(columns=EXPECTED_COLS)
+
+@st.cache_data(ttl=3600)
+def prepare_prob_r_cached(df, round_num):
+    df_r = df[df['round'] == round_num].copy()
+    if df_r.empty:
+        return pd.DataFrame()
+    group_cols = ['stake', 'win_category']
+    for i in range(1, round_num):
+        group_cols.append(f'prev{i}_outcome')
+        group_cols.append(f'prev{i}_my_move')
+        group_cols.append(f'prev{i}_opp_move')
+    counts = df_r.groupby(group_cols)['opp_move'].value_counts().reset_index(name='count')
+    counts['prob'] = counts.groupby(group_cols)['count'].transform(lambda x: x / x.sum())
+    return counts
 
 # -------------------- Стратегия 1 раунда --------------------
 def get_optimal_move_r1(stake, win_category, df):
@@ -136,10 +140,7 @@ def get_optimal_move_r1(stake, win_category, df):
 def get_optimal_move_r_cascade(stake, win_category, outcomes, my_moves, opp_moves, prob_r, df_full, round_num):
     if prob_r.empty:
         return None, 0, 0
-    max_prev = 0
-    for i in range(1, round_num):
-        if f'prev{i}_outcome' in prob_r.columns:
-            max_prev = i
+    max_prev = round_num - 1
     for depth in range(max_prev, 0, -1):
         mask = (prob_r['stake'] == stake) & (prob_r['win_category'] == win_category)
         ok = True
@@ -232,6 +233,7 @@ def get_last_n_records(n=10):
     if df.empty:
         return df
     df_last = df.tail(n).copy()
+    # Преобразование для отображения
     for col in df_last.columns:
         if col.endswith('_move') and col not in ['my_move', 'opp_move']:
             df_last[col] = df_last[col].map(lambda x: LETTER_TO_MOVE.get(x, x))
