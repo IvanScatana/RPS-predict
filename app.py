@@ -131,8 +131,11 @@ def get_optimal_move_r1(stake, win_category, df):
         best = 'Н'
     else:
         best = 'Б'
-    best_count = counts.get(best, 0)
-    confidence = best_count / total if total > 0 else 0
+    # Уверенность = вероятность не проиграть (победа + ничья)
+    win_condition = {'К': 'Н', 'Н': 'Б', 'Б': 'К'}
+    win_count = counts.get(win_condition[best], 0)
+    draw_count = counts.get(best, 0)
+    confidence = (win_count + draw_count) / total if total > 0 else 0
     return best, confidence, total
 
 # -------------------- Каскадный поиск --------------------
@@ -157,32 +160,20 @@ def get_optimal_move_r_cascade(stake, win_category, outcomes, my_moves, opp_move
             continue
         subset = prob_r[mask]
         if len(subset) > 0:
-            # Вычисляем ожидаемый выигрыш для своего хода (через prob)
-            p_k = subset[subset['opp_move'] == 'К']['prob'].sum()
-            p_n = subset[subset['opp_move'] == 'Н']['prob'].sum()
-            p_b = subset[subset['opp_move'] == 'Б']['prob'].sum()
-            exp_k = p_n - p_b
-            exp_n = p_b - p_k
-            exp_b = p_k - p_n
-            if exp_k >= exp_n and exp_k >= exp_b:
-                best_move = 'К'
-            elif exp_n >= exp_b:
-                best_move = 'Н'
-            else:
-                best_move = 'Б'
-            
-            total_count = subset['count'].sum()
-            # Подсчитываем количество исходов, где мы не проигрываем (победа или ничья)
-            not_lose_count = 0
-            for opp, cnt in zip(subset['opp_move'], subset['count']):
-                if best_move == opp:
-                    not_lose_count += cnt  # ничья
-                elif (best_move == 'К' and opp == 'Н') or \
-                     (best_move == 'Н' and opp == 'Б') or \
-                     (best_move == 'Б' and opp == 'К'):
-                    not_lose_count += cnt  # победа
-            confidence = not_lose_count / total_count if total_count > 0 else 0
-            support = total_count
+            # Вычисляем для каждого своего хода вероятность не проиграть
+            not_lose = {}
+            for my_move in ['К', 'Н', 'Б']:
+                win_draw = 0
+                for opp, cnt in zip(subset['opp_move'], subset['count']):
+                    if my_move == opp:
+                        win_draw += cnt  # ничья
+                    elif (my_move == 'К' and opp == 'Н') or (my_move == 'Н' and opp == 'Б') or (my_move == 'Б' and opp == 'К'):
+                        win_draw += cnt  # победа
+                total = subset['count'].sum()
+                not_lose[my_move] = win_draw / total if total > 0 else 0
+            best_move = max(not_lose, key=not_lose.get)
+            confidence = not_lose[best_move]
+            support = subset['count'].sum()
             return best_move, confidence, support
     opt, conf, sup = get_optimal_move_r1(stake, win_category, df_full)
     return opt, conf, 0
