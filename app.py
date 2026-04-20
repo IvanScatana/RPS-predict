@@ -65,6 +65,9 @@ def load_data_cached():
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        # Приводим is_last_round к int (если он float)
+        if 'is_last_round' in df.columns:
+            df['is_last_round'] = df['is_last_round'].astype(int)
         if 'player_name' in df.columns:
             df['player_name'] = df['player_name'].astype(str).replace('nan', '')
         else:
