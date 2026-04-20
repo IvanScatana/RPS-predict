@@ -158,9 +158,11 @@ def get_optimal_move_r_cascade(stake, win_category, outcomes, my_moves, opp_move
             continue
         subset = prob_r[mask]
         if len(subset) > 0:
-            p_k = subset[subset['opp_move'] == 'К']['prob'].sum()
-            p_n = subset[subset['opp_move'] == 'Н']['prob'].sum()
-            p_b = subset[subset['opp_move'] == 'Б']['prob'].sum()
+            # Вычисляем ожидаемый выигрыш для своего хода (на основе частот)
+            total = subset['count'].sum()
+            p_k = subset[subset['opp_move'] == 'К']['count'].sum() / total
+            p_n = subset[subset['opp_move'] == 'Н']['count'].sum() / total
+            p_b = subset[subset['opp_move'] == 'Б']['count'].sum() / total
             exp_k = p_n - p_b
             exp_n = p_b - p_k
             exp_b = p_k - p_n
@@ -170,8 +172,19 @@ def get_optimal_move_r_cascade(stake, win_category, outcomes, my_moves, opp_move
                 best_move = 'Н'
             else:
                 best_move = 'Б'
-            confidence = subset[subset['opp_move'] == best_move]['prob'].sum()
-            support = subset['count'].sum()
+            # Уверенность = вероятность НЕ проиграть (победа или ничья) при выбранном ходе
+            # Для заданного best_move (наш ход) нужно посчитать, как часто мы не проигрываем
+            # против ходов соперника из subset. Проще: уверенность = 1 - вероятность проигрыша.
+            # Проигрыш: если наш ход проигрывает ходу соперника.
+            lose_condition = {
+                'К': 'Б',  # камень проигрывает бумаге
+                'Н': 'К',  # ножницы проигрывают камню
+                'Б': 'Н'   # бумага проигрывает ножницам
+            }
+            losing_opp_move = lose_condition[best_move]
+            prob_lose = subset[subset['opp_move'] == losing_opp_move]['count'].sum() / total
+            confidence = 1 - prob_lose
+            support = total
             return best_move, confidence, support
     opt, conf, sup = get_optimal_move_r1(stake, win_category, df_full)
     return opt, conf, 0
