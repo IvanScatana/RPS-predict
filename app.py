@@ -62,7 +62,6 @@ def load_data_cached():
         return pd.DataFrame(columns=EXPECTED_COLS)
     try:
         df = pd.read_csv(DATA_PATH, sep=',', encoding='utf-8')
-        # Приведение типов
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
@@ -158,7 +157,7 @@ def get_optimal_move_r_cascade(stake, win_category, outcomes, my_moves, opp_move
             continue
         subset = prob_r[mask]
         if len(subset) > 0:
-            # Вычисляем ожидаемый выигрыш для своего хода (используем prob, как было раньше)
+            # Вычисляем ожидаемый выигрыш для своего хода (через prob, как работало)
             p_k = subset[subset['opp_move'] == 'К']['prob'].sum()
             p_n = subset[subset['opp_move'] == 'Н']['prob'].sum()
             p_b = subset[subset['opp_move'] == 'Б']['prob'].sum()
@@ -171,7 +170,7 @@ def get_optimal_move_r_cascade(stake, win_category, outcomes, my_moves, opp_move
                 best_move = 'Н'
             else:
                 best_move = 'Б'
-            # Исправляем уверенность: считаем долю count, а не сумму prob
+            # Уверенность и поддержка через count (чтобы не было >100%)
             total_count = subset['count'].sum()
             win_count = subset[subset['opp_move'] == best_move]['count'].sum()
             confidence = win_count / total_count if total_count > 0 else 0
@@ -254,6 +253,16 @@ def get_last_n_records(n=10):
     return df_last
 
 # -------------------- Инициализация сессии --------------------
+def refresh_prob_tables():
+    """Обновляет все таблицы вероятностей на основе текущих данных"""
+    st.session_state.df_full = load_data_cached()
+    st.session_state.prob_r2 = prepare_prob_r_cached(st.session_state.df_full, 2)
+    st.session_state.prob_r3 = prepare_prob_r_cached(st.session_state.df_full, 3)
+    st.session_state.prob_r4 = prepare_prob_r_cached(st.session_state.df_full, 4)
+    st.session_state.prob_r5 = prepare_prob_r_cached(st.session_state.df_full, 5)
+    st.session_state.prob_r6 = prepare_prob_r_cached(st.session_state.df_full, 6)
+    st.session_state.prob_r7 = prepare_prob_r_cached(st.session_state.df_full, 7)
+
 def init_session():
     if 'game_state' not in st.session_state:
         st.session_state.game_state = 'setup'
@@ -268,14 +277,8 @@ def init_session():
         st.session_state.selected_opp = None
         st.session_state.selected_outcome = None
         st.session_state.player_name = ""
-    if 'df_full' not in st.session_state:
-        st.session_state.df_full = load_data_cached()
-        st.session_state.prob_r2 = prepare_prob_r_cached(st.session_state.df_full, 2)
-        st.session_state.prob_r3 = prepare_prob_r_cached(st.session_state.df_full, 3)
-        st.session_state.prob_r4 = prepare_prob_r_cached(st.session_state.df_full, 4)
-        st.session_state.prob_r5 = prepare_prob_r_cached(st.session_state.df_full, 5)
-        st.session_state.prob_r6 = prepare_prob_r_cached(st.session_state.df_full, 6)
-        st.session_state.prob_r7 = prepare_prob_r_cached(st.session_state.df_full, 7)
+    # Всегда обновляем данные и таблицы (кеш уже очищен при необходимости)
+    refresh_prob_tables()
 
 # ========================
 # Основное приложение
@@ -303,7 +306,7 @@ if st.session_state.game_state == 'setup':
             winrate = winrate_percent / 100.0
         stake = st.selectbox("Ставка", [25, 50, 100])
         if st.form_submit_button("Начать матч"):
-            st.session_state.player_name = player_name if player_name else "Неизвестный"
+            st.session_state.player_name = player_name if player_name else "Неизвестен"
             st.session_state.opp_stats = {'wins': wins, 'winrate': winrate, 'stake': stake}
             st.session_state.match_id = next_match_id()
             st.session_state.game_state = 'playing'
@@ -455,6 +458,9 @@ elif st.session_state.game_state == 'playing':
             st.rerun()
 
         # --- ПРЕДСКАЗАНИЕ СЛЕДУЮЩЕГО РАУНДА ---
+        # Обновляем таблицы вероятностей, так как данные изменились
+        refresh_prob_tables()
+
         next_round_num = st.session_state.round_num + 1
         stake_val = st.session_state.opp_stats['stake']
         win_cat = compute_win_category(st.session_state.opp_stats['wins'])
