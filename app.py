@@ -291,31 +291,45 @@ def retrain_model():
     return model, global_freq
 
 # ========================
-# Функция предсказания (модель + правила)
+# Функция предсказания (модель + правила + максимизация выигрыша)
 # ========================
 def predict_next_ml(context_row, model, global_freq, history):
-    """Возвращает оптимальный ход (букву 'К','Н','Б') и уверенность."""
+    """Возвращает оптимальный ход (букву 'К','Н','Б') и уверенность (макс. вероятность хода противника)."""
     df_input = pd.DataFrame([context_row])
     df_feat = create_features(df_input, global_freq)
     X, cat_feats = prepare_features(df_feat)
     # Приводим колонки к тем, что были при обучении (на случай расхождений)
-    # model.feature_names_ может не совпадать, поэтому переиндексируем
     expected_features = model.feature_names_
     if expected_features is not None:
         X = X.reindex(columns=expected_features, fill_value=0)
     proba = model.predict_proba(X)[0]   # вероятности классов 0,1,2
-    # В обучении: optimal_idx = 0->Б, 1->К, 2->Н (map {'К':1, 'Н':2, 'Б':0})
+    # В обучении: 0->Б, 1->К, 2->Н
     idx_to_move = {0: 'Б', 1: 'К', 2: 'Н'}
-    pred_idx = np.argmax(proba)
-    pred_move = idx_to_move[pred_idx]
-    confidence = proba[pred_idx]
+    # Словарь payoff: наш ход -> {ход противника: payoff}
+    payoff = {
+        'К': {'К': 0, 'Н': 1, 'Б': -1},
+        'Н': {'К': -1, 'Н': 0, 'Б': 1},
+        'Б': {'К': 1, 'Н': -1, 'Б': 0}
+    }
+
+    # Ожидаемый выигрыш для каждого нашего хода
+    expected = {}
+    for my_move in ['К', 'Н', 'Б']:
+        exp = 0.0
+        for opp_idx, opp_move in idx_to_move.items():
+            exp += proba[opp_idx] * payoff[my_move][opp_move]
+        expected[my_move] = exp
+
+    # Выбираем ход с максимальным ожидаемым выигрышем
+    pred_move = max(expected, key=expected.get)
+    confidence = max(proba)  # сохраняем максимальную вероятность хода противника (интерфейс не меняем)
 
     # Правила по текущему матчу
     if history:
         last = history[-1]
         last_opp = last['opp_move']
         last_outcome = last['outcome']
-        # После ничьей – бей ход соперника
+        # После ничьей – бей ход соперника (переопределяем с полной уверенностью)
         if last_outcome == 'draw' and last_opp in ['К','Н','Б']:
             beat = {'К': 'Н', 'Н': 'Б', 'Б': 'К'}
             return beat[last_opp], 1.0   # полная уверенность
@@ -328,7 +342,7 @@ def predict_next_ml(context_row, model, global_freq, history):
                 alternatives = [m for m in ['К','Н','Б'] if m != avoid]
                 if pred_move == avoid:
                     pred_move = alternatives[0]
-                    # Уверенность можно оставить от модели (или снизить)
+                    # Уверенность оставляем как было (макс. вероятность оппа)
     return pred_move, confidence
 
 # ========================
